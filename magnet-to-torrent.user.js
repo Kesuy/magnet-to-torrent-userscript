@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      3.0.0
-// @description  识别页面中的磁力链接，并添加轻量、无重复的 .torrent 下载按钮
+// @version      3.1.0
+// @description  识别页面中的磁力链接，按种子实际名称下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        GM_download
+// @connect      itorrents.org
 // @run-at       document-end
 // @license      MIT
 // @updateURL    https://raw.githubusercontent.com/Kesuy/magnet-to-torrent-userscript/main/magnet-to-torrent.user.js
@@ -81,6 +83,162 @@
         return results;
     }
 
+    function parseBencode(input) {
+        const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+        const decoder = new TextDecoder();
+        let offset = 0;
+
+        function parseBytes() {
+            const lengthStart = offset;
+            while (offset < bytes.length && bytes[offset] >= 48 && bytes[offset] <= 57) offset += 1;
+            if (offset === lengthStart || bytes[offset] !== 58) throw new Error('无效的 bencode 字符串');
+            const length = Number.parseInt(decoder.decode(bytes.subarray(lengthStart, offset)), 10);
+            offset += 1;
+            const end = offset + length;
+            if (!Number.isSafeInteger(length) || length < 0 || end > bytes.length) {
+                throw new Error('bencode 字符串长度越界');
+            }
+            const value = bytes.subarray(offset, end);
+            offset = end;
+            return value;
+        }
+
+        function parseValue(depth = 0) {
+            if (depth > 100 || offset >= bytes.length) throw new Error('无效的 bencode 数据');
+            const token = bytes[offset];
+
+            if (token >= 48 && token <= 57) return parseBytes();
+            if (token === 105) {
+                offset += 1;
+                const start = offset;
+                while (offset < bytes.length && bytes[offset] !== 101) offset += 1;
+                if (offset >= bytes.length) throw new Error('未结束的 bencode 整数');
+                const value = Number.parseInt(decoder.decode(bytes.subarray(start, offset)), 10);
+                offset += 1;
+                if (!Number.isSafeInteger(value)) throw new Error('无效的 bencode 整数');
+                return value;
+            }
+            if (token === 108) {
+                offset += 1;
+                const list = [];
+                while (offset < bytes.length && bytes[offset] !== 101) list.push(parseValue(depth + 1));
+                if (offset >= bytes.length) throw new Error('未结束的 bencode 列表');
+                offset += 1;
+                return list;
+            }
+            if (token === 100) {
+                offset += 1;
+                const dictionary = Object.create(null);
+                while (offset < bytes.length && bytes[offset] !== 101) {
+                    const key = decoder.decode(parseBytes());
+                    dictionary[key] = parseValue(depth + 1);
+                }
+                if (offset >= bytes.length) throw new Error('未结束的 bencode 字典');
+                offset += 1;
+                return dictionary;
+            }
+            throw new Error('未知的 bencode 类型');
+        }
+
+        const result = parseValue();
+        if (offset !== bytes.length) throw new Error('bencode 数据尾部存在多余内容');
+        return result;
+    }
+
+    function parseTorrentName(input) {
+        const root = parseBencode(input);
+        const info = root?.info;
+        const rawName = info?.['name.utf-8'] || info?.name;
+        if (!(rawName instanceof Uint8Array)) throw new Error('torrent 中缺少 info.name');
+        const name = new TextDecoder('utf-8').decode(rawName).replace(/\0/g, '').trim();
+        if (!name) throw new Error('torrent 名称为空');
+        return name;
+    }
+
+    function sanitizeFilename(name) {
+        const replacements = {
+            '<': '＜', '>': '＞', ':': '：', '"': '＂', '/': '／', '\\': '＼',
+            '|': '｜', '?': '？', '*': '＊',
+        };
+        let safe = name.normalize('NFKC')
+            .replace(/[<>:"/\\|?*]/g, char => replacements[char])
+            .replace(/[\u0000-\u001f\u007f]/g, '')
+            .replace(/[. ]+$/g, '')
+            .trim();
+        safe = [...safe].slice(0, 180).join('').replace(/[. ]+$/g, '');
+        if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(safe)) safe = `_${safe}`;
+        return safe;
+    }
+
+    function torrentFilename(input, fallbackHash) {
+        let name;
+        try {
+            name = sanitizeFilename(parseTorrentName(input));
+        } catch {
+            name = fallbackHash;
+        }
+        if (!name) name = 'download';
+        return /\.torrent$/i.test(name) ? name : `${name}.torrent`;
+    }
+
+    function requestTorrent(hash) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                reject(new Error('当前 userscript 管理器不支持 GM_xmlhttpRequest'));
+                return;
+            }
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: torrentUrl(hash),
+                responseType: 'arraybuffer',
+                timeout: 30000,
+                anonymous: true,
+                onload(response) {
+                    if (response.status < 200 || response.status >= 300 || !response.response) {
+                        reject(new Error(`下载 torrent 失败（HTTP ${response.status}）`));
+                        return;
+                    }
+                    resolve(new Uint8Array(response.response));
+                },
+                onerror: () => reject(new Error('下载 torrent 时发生网络错误')),
+                ontimeout: () => reject(new Error('下载 torrent 超时')),
+            });
+        });
+    }
+
+    async function downloadTorrent(hash) {
+        const bytes = await requestTorrent(hash);
+        const filename = torrentFilename(bytes, hash);
+        const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/x-bittorrent' }));
+        const anchor = document.createElement('a');
+        anchor.href = blobUrl;
+        anchor.download = filename;
+        anchor.style.display = 'none';
+        anchor.setAttribute(OWNED_ATTR, '');
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        return filename;
+    }
+
+    function fallbackDownload(hash) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_download !== 'function') {
+                reject(new Error('当前 userscript 管理器不支持 GM_download'));
+                return;
+            }
+            GM_download({
+                url: torrentUrl(hash),
+                name: `${hash}.torrent`,
+                saveAs: false,
+                onload: resolve,
+                onerror: reject,
+                ontimeout: reject,
+            });
+        });
+    }
+
     function injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
         const style = document.createElement('style');
@@ -107,6 +265,37 @@
         button.className = 'mtt-button';
         button.setAttribute(OWNED_ATTR, '');
         button.setAttribute('aria-label', `下载种子 ${hash}`);
+        button.addEventListener('click', async event => {
+            event.preventDefault();
+            if (button.dataset.downloading === 'true') return;
+            button.dataset.downloading = 'true';
+            button.setAttribute('aria-disabled', 'true');
+            const originalText = button.textContent;
+            button.textContent = '⏳ 读取名称';
+            try {
+                const filename = await downloadTorrent(hash);
+                button.textContent = '✅ 已下载';
+                button.title = filename;
+            } catch (error) {
+                console.warn('[磁力转种子] 无法读取实际名称，改用 hash 文件名下载：', error);
+                button.textContent = '⏳ 直接下载';
+                try {
+                    await fallbackDownload(hash);
+                    button.textContent = '✅ 已下载';
+                    button.title = `${hash}.torrent`;
+                } catch (fallbackError) {
+                    console.error('[磁力转种子] 下载失败：', fallbackError);
+                    button.textContent = '❌ 下载失败';
+                    button.title = fallbackError?.message || String(fallbackError);
+                }
+            } finally {
+                setTimeout(() => {
+                    button.textContent = originalText;
+                    button.removeAttribute('aria-disabled');
+                    delete button.dataset.downloading;
+                }, 1800);
+            }
+        });
         return button;
     }
 
@@ -245,11 +434,14 @@
 
     if (globalThis.__MAGNET_TO_TORRENT_TEST_MODE__) {
         globalThis.__MAGNET_TO_TORRENT_TEST__ = {
+            downloadTorrent,
             extractHash,
             findMagnets,
             normalizeHash,
+            parseTorrentName,
             scan,
             stop: () => observer.disconnect(),
+            torrentFilename,
             torrentUrl,
         };
     }

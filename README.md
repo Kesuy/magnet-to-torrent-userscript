@@ -8,6 +8,14 @@
 
 需要先安装 [Tampermonkey](https://www.tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/)。
 
+## 3.1.0：按实际名称保存
+
+- 点击按钮后先读取 `.torrent` 文件并解析 bencode 格式的 `info.name.utf-8` / `info.name`。
+- 下载文件自动命名为种子记录的实际名称，例如 `My Movie!.torrent`，不再默认使用 hash。
+- 自动替换 Windows 文件名中的非法字符，并处理设备保留名和超长名称。
+- 获取或解析元数据失败时，会回退到原来的 hash 文件名下载，不影响基本可用性。
+- 下载期间按钮会显示读取、成功或失败状态，避免连续重复点击。
+
 ## 3.0.0 优化内容
 
 - 删除原脚本中意外重复的整段代码，避免同时运行两个 observer。
@@ -32,7 +40,7 @@
 
 ## 隐私与限制
 
-脚本使用 `@match *://*/*`，因为它需要在任意网页识别磁力链接；脚本不使用任何 `GM_*` 特权，也不会上传页面内容。只有在你点击 **📥 种子** 后，浏览器才会打开 `itorrents.org`。能否成功下载取决于该 hash 是否已被 iTorrents 缓存。
+脚本使用 `@match *://*/*`，因为它需要在任意网页识别磁力链接。点击 **📥 种子** 后，脚本通过 `GM_xmlhttpRequest` 从 `itorrents.org` 获取 torrent 内容，在浏览器本地解析名称并保存；不会上传页面内容或 torrent 内容。能否成功下载取决于该 hash 是否已被 iTorrents 缓存。
 
 ## 本地验证
 
@@ -41,7 +49,7 @@ npm install
 npm run check
 ```
 
-测试覆盖 Base32 转换、重复扫描、普通文本、代码块、排除元素和动态 DOM。
+测试覆盖 Base32 转换、bencode 名称解析、Windows 安全文件名、实际名称下载、重复扫描、普通文本、代码块、排除元素和动态 DOM。
 
 ## License
 

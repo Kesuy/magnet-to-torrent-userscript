@@ -1,6 +1,6 @@
 {
   "name": "magnet-to-torrent-userscript",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "private": true,
   "description": "为网页中的磁力链接添加 .torrent 下载按钮",
   "type": "module",
