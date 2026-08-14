@@ -8,6 +8,14 @@
 
 需要先安装 [Tampermonkey](https://www.tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/)。
 
+## 3.1.1：修复下载失败并增加多源回退
+
+- 修复 iTorrents 从 `itorrents.org` 重定向到 `itorrents.net` 后，被 userscript 跨域权限拦截的问题。
+- 改为直接优先访问实际提供文件的 `itorrents.net`。
+- 增加 Torrage 作为独立缓存源，并保留 `itorrents.org` 作为末级回退。
+- 当前源返回 404、网络错误或非 torrent 内容时，会自动尝试下一个源。
+- 只有成功解析出 torrent 元数据后才会保存，避免把 HTML 错误页下载成 `.torrent`。
+
 ## 3.1.0：按实际名称保存
 
 - 点击按钮后先读取 `.torrent` 文件并解析 bencode 格式的 `info.name.utf-8` / `info.name`。
@@ -40,7 +48,7 @@
 
 ## 隐私与限制
 
-脚本使用 `@match *://*/*`，因为它需要在任意网页识别磁力链接。点击 **📥 种子** 后，脚本通过 `GM_xmlhttpRequest` 从 `itorrents.org` 获取 torrent 内容，在浏览器本地解析名称并保存；不会上传页面内容或 torrent 内容。能否成功下载取决于该 hash 是否已被 iTorrents 缓存。
+脚本使用 `@match *://*/*`，因为它需要在任意网页识别磁力链接。点击 **📥 种子** 后，脚本通过 `GM_xmlhttpRequest` 依次从 iTorrents 和 Torrage 获取 torrent 内容，在浏览器本地解析名称并保存；不会上传页面内容或 torrent 内容。能否成功下载取决于至少一个缓存源是否收录了该 hash。
 
 ## 本地验证
 

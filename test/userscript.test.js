@@ -29,6 +29,11 @@ function encode(value) {
     return new TextEncoder().encode(value);
 }
 
+test('metadata 授权所有下载源及 iTorrents 重定向域名', () => {
+    assert.match(source, /^\/\/ @connect\s+itorrents\.net$/m);
+    assert.match(source, /^\/\/ @connect\s+torrage\.info$/m);
+});
+
 test('将 32 位 Base32 BTIH 正确转换为 40 位十六进制', () => {
     const { dom, api } = boot('');
     assert.equal(api.normalizeHash(BASE32_HASH), '0123456789ABCDEF0123456789ABCDEF01234567');
@@ -70,7 +75,7 @@ test('下载时先读取 torrent 元数据，再按实际名称保存 Blob', asy
     };
 
     const filename = await api.downloadTorrent(HEX_HASH);
-    assert.equal(events.request.url, `https://itorrents.org/torrent/${HEX_HASH}.torrent`);
+    assert.equal(events.request.url, `https://itorrents.net/torrent/${HEX_HASH}.torrent`);
     assert.equal(events.request.responseType, 'arraybuffer');
     assert.equal(filename, 'My Movie!.torrent');
     assert.deepEqual(events.download, { href: 'blob:test-torrent', filename: 'My Movie!.torrent' });
@@ -80,10 +85,34 @@ test('下载时先读取 torrent 元数据，再按实际名称保存 Blob', asy
     dom.window.close();
 });
 
+test('当前一个缓存源失败时自动尝试下一个源', async () => {
+    const torrent = encode('d4:infod4:name9:My Movie!ee');
+    const requested = [];
+    const { dom, api } = boot('', {
+        GM_xmlhttpRequest(options) {
+            requested.push(options.url);
+            if (requested.length < 3) {
+                queueMicrotask(() => options.onload({ status: 404, response: new ArrayBuffer(0) }));
+            } else {
+                queueMicrotask(() => options.onload({ status: 200, response: torrent.buffer }));
+            }
+        },
+    });
+
+    const bytes = await api.requestTorrent(HEX_HASH);
+    assert.equal(api.parseTorrentName(bytes), 'My Movie!');
+    assert.deepEqual(requested, [
+        `https://itorrents.net/torrent/${HEX_HASH}.torrent`,
+        `https://torrage.info/torrent/${HEX_HASH}.torrent`,
+        `https://itorrents.org/torrent/${HEX_HASH}.torrent`,
+    ]);
+    dom.window.close();
+});
+
 test('为 magnet 链接添加一个安全的 torrent 按钮且重复扫描不重复', () => {
     const { dom, api, document } = boot(`<a id="magnet" href="magnet:?xt=urn:btih:${HEX_HASH}&dn=demo">下载</a>`);
     assert.equal(buttons(document).length, 1);
-    assert.equal(buttons(document)[0].href, `https://itorrents.org/torrent/${HEX_HASH}.torrent`);
+    assert.equal(buttons(document)[0].href, `https://itorrents.net/torrent/${HEX_HASH}.torrent`);
     assert.equal(buttons(document)[0].rel, 'noopener noreferrer');
     assert.equal(buttons(document)[0].referrerPolicy, 'no-referrer');
     api.scan(document.body);

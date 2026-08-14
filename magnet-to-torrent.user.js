@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      3.1.0
+// @version      3.1.1
 // @description  识别页面中的磁力链接，按种子实际名称下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
+// @connect      itorrents.net
 // @connect      itorrents.org
+// @connect      torrage.info
 // @run-at       document-end
 // @license      MIT
 // @updateURL    https://raw.githubusercontent.com/Kesuy/magnet-to-torrent-userscript/main/magnet-to-torrent.user.js
@@ -18,7 +20,11 @@
     'use strict';
 
     const CONFIG = Object.freeze({
-        torrentCache: 'https://itorrents.org/torrent/',
+        torrentSources: Object.freeze([
+            hash => `https://itorrents.net/torrent/${hash}.torrent`,
+            hash => `https://torrage.info/torrent/${hash}.torrent`,
+            hash => `https://itorrents.org/torrent/${hash}.torrent`,
+        ]),
         buttonText: '📥 种子',
         debounceMs: 180,
     });
@@ -65,7 +71,11 @@
     }
 
     function torrentUrl(hash) {
-        return `${CONFIG.torrentCache}${hash}.torrent`;
+        return CONFIG.torrentSources[0](hash);
+    }
+
+    function torrentUrls(hash) {
+        return CONFIG.torrentSources.map(buildUrl => buildUrl(hash));
     }
 
     function trimMagnet(raw) {
@@ -181,7 +191,7 @@
         return /\.torrent$/i.test(name) ? name : `${name}.torrent`;
     }
 
-    function requestTorrent(hash) {
+    function requestTorrentUrl(url) {
         return new Promise((resolve, reject) => {
             if (typeof GM_xmlhttpRequest !== 'function') {
                 reject(new Error('当前 userscript 管理器不支持 GM_xmlhttpRequest'));
@@ -189,7 +199,7 @@
             }
             GM_xmlhttpRequest({
                 method: 'GET',
-                url: torrentUrl(hash),
+                url,
                 responseType: 'arraybuffer',
                 timeout: 30000,
                 anonymous: true,
@@ -204,6 +214,20 @@
                 ontimeout: () => reject(new Error('下载 torrent 超时')),
             });
         });
+    }
+
+    async function requestTorrent(hash) {
+        const errors = [];
+        for (const url of torrentUrls(hash)) {
+            try {
+                const bytes = await requestTorrentUrl(url);
+                parseTorrentName(bytes);
+                return bytes;
+            } catch (error) {
+                errors.push(`${new URL(url).hostname}: ${error?.message || error}`);
+            }
+        }
+        throw new Error(`所有 torrent 缓存源均不可用：${errors.join('；')}`);
     }
 
     async function downloadTorrent(hash) {
@@ -222,14 +246,14 @@
         return filename;
     }
 
-    function fallbackDownload(hash) {
+    function fallbackDownloadUrl(url, hash) {
         return new Promise((resolve, reject) => {
             if (typeof GM_download !== 'function') {
                 reject(new Error('当前 userscript 管理器不支持 GM_download'));
                 return;
             }
             GM_download({
-                url: torrentUrl(hash),
+                url,
                 name: `${hash}.torrent`,
                 saveAs: false,
                 onload: resolve,
@@ -237,6 +261,19 @@
                 ontimeout: reject,
             });
         });
+    }
+
+    async function fallbackDownload(hash) {
+        let lastError;
+        for (const url of torrentUrls(hash)) {
+            try {
+                await fallbackDownloadUrl(url, hash);
+                return;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+        throw lastError || new Error('所有 torrent 缓存源均不可用');
     }
 
     function injectStyles() {
@@ -439,6 +476,7 @@
             findMagnets,
             normalizeHash,
             parseTorrentName,
+            requestTorrent,
             scan,
             stop: () => observer.disconnect(),
             torrentFilename,
