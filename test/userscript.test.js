@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash, webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { TextDecoder, TextEncoder } from 'node:util';
@@ -7,6 +8,9 @@ import { JSDOM } from 'jsdom';
 const source = await readFile(new URL('../magnet-to-torrent.user.js', import.meta.url), 'utf8');
 const HEX_HASH = '0123456789ABCDEF0123456789ABCDEF01234567';
 const BASE32_HASH = 'AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH';
+const TORRENT_INFO = new TextEncoder().encode('d4:name9:My Movie!e');
+const TORRENT_BYTES = new TextEncoder().encode('d4:infod4:name9:My Movie!ee');
+const TORRENT_HASH = createHash('sha1').update(TORRENT_INFO).digest('hex').toUpperCase();
 
 function boot(body, globals = {}) {
     const dom = new JSDOM(`<!doctype html><html><head></head><body>${body}</body></html>`, {
@@ -14,6 +18,7 @@ function boot(body, globals = {}) {
         url: 'https://example.com/topic',
     });
     Object.assign(dom.window, { TextDecoder, TextEncoder }, globals);
+    Object.defineProperty(dom.window, 'crypto', { configurable: true, value: webcrypto });
     dom.window.__MAGNET_TO_TORRENT_TEST_MODE__ = true;
     dom.window.eval(source);
     const api = dom.window.__MAGNET_TO_TORRENT_TEST__;
@@ -42,8 +47,14 @@ test('将 32 位 Base32 BTIH 正确转换为 40 位十六进制', () => {
 
 test('从 torrent 的 info.name 中解析实际名称', () => {
     const { dom, api } = boot('');
-    const torrent = encode('d4:infod4:name9:My Movie!ee');
-    assert.equal(api.parseTorrentName(torrent), 'My Movie!');
+    assert.equal(api.parseTorrentName(TORRENT_BYTES), 'My Movie!');
+    dom.window.close();
+});
+
+test('拒绝 infohash 与请求 hash 不一致的 torrent', async () => {
+    const { dom, api } = boot('');
+    await assert.rejects(api.verifyTorrentHash(TORRENT_BYTES, HEX_HASH), /infohash 不匹配/);
+    await assert.doesNotReject(api.verifyTorrentHash(TORRENT_BYTES, TORRENT_HASH));
     dom.window.close();
 });
 
@@ -57,12 +68,11 @@ test('优先读取 UTF-8 名称并清理 Windows 非法文件名字符', () => {
 });
 
 test('下载时先读取 torrent 元数据，再按实际名称保存 Blob', async () => {
-    const torrent = encode('d4:infod4:name9:My Movie!ee');
     const events = {};
     const { dom, api } = boot('', {
         GM_xmlhttpRequest(options) {
             events.request = options;
-            queueMicrotask(() => options.onload({ status: 200, response: torrent.buffer }));
+            queueMicrotask(() => options.onload({ status: 200, response: TORRENT_BYTES.buffer }));
         },
     });
     dom.window.URL.createObjectURL = blob => {
@@ -74,8 +84,8 @@ test('下载时先读取 torrent 元数据，再按实际名称保存 Blob', asy
         events.download = { href: this.href, filename: this.download };
     };
 
-    const filename = await api.downloadTorrent(HEX_HASH);
-    assert.equal(events.request.url, `https://itorrents.net/torrent/${HEX_HASH}.torrent`);
+    const filename = await api.downloadTorrent(TORRENT_HASH);
+    assert.equal(events.request.url, `https://itorrents.net/torrent/${TORRENT_HASH}.torrent`);
     assert.equal(events.request.responseType, 'arraybuffer');
     assert.equal(filename, 'My Movie!.torrent');
     assert.deepEqual(events.download, { href: 'blob:test-torrent', filename: 'My Movie!.torrent' });
@@ -86,7 +96,6 @@ test('下载时先读取 torrent 元数据，再按实际名称保存 Blob', asy
 });
 
 test('当前一个缓存源失败时自动尝试下一个源', async () => {
-    const torrent = encode('d4:infod4:name9:My Movie!ee');
     const requested = [];
     const { dom, api } = boot('', {
         GM_xmlhttpRequest(options) {
@@ -94,17 +103,17 @@ test('当前一个缓存源失败时自动尝试下一个源', async () => {
             if (requested.length < 3) {
                 queueMicrotask(() => options.onload({ status: 404, response: new ArrayBuffer(0) }));
             } else {
-                queueMicrotask(() => options.onload({ status: 200, response: torrent.buffer }));
+                queueMicrotask(() => options.onload({ status: 200, response: TORRENT_BYTES.buffer }));
             }
         },
     });
 
-    const bytes = await api.requestTorrent(HEX_HASH);
+    const bytes = await api.requestTorrent(TORRENT_HASH);
     assert.equal(api.parseTorrentName(bytes), 'My Movie!');
     assert.deepEqual(requested, [
-        `https://itorrents.net/torrent/${HEX_HASH}.torrent`,
-        `https://torrage.info/torrent/${HEX_HASH}.torrent`,
-        `https://itorrents.org/torrent/${HEX_HASH}.torrent`,
+        `https://itorrents.net/torrent/${TORRENT_HASH}.torrent`,
+        `https://torrage.info/torrent/${TORRENT_HASH}.torrent`,
+        `https://itorrents.org/torrent/${TORRENT_HASH}.torrent`,
     ]);
     dom.window.close();
 });

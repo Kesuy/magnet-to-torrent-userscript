@@ -8,6 +8,12 @@
 
 需要先安装 [Tampermonkey](https://www.tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/)。
 
+## 3.1.2：校验 torrent 身份
+
+- 下载前重新计算 torrent `info` 字典的 SHA-1，并确认它与磁力链接中的 BTIH 完全一致。
+- 缓存服务返回错误或无关的 torrent 时会安全拒绝，不再按错误名称保存。
+- 移除无法校验内容的直接下载回退，避免缓存源异常时下载到错误文件。
+
 ## 3.1.1：修复下载失败并增加多源回退
 
 - 修复 iTorrents 从 `itorrents.org` 重定向到 `itorrents.net` 后，被 userscript 跨域权限拦截的问题。

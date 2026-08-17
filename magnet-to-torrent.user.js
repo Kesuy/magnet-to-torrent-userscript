@@ -1,12 +1,11 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      3.1.1
+// @version      3.1.2
 // @description  识别页面中的磁力链接，按种子实际名称下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
-// @grant        GM_download
 // @connect      itorrents.net
 // @connect      itorrents.org
 // @connect      torrage.info
@@ -165,6 +164,127 @@
         return name;
     }
 
+    function extractInfoBytes(input) {
+        const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+        const decoder = new TextDecoder();
+        let offset = 0;
+
+        function skipBytes() {
+            const start = offset;
+            while (offset < bytes.length && bytes[offset] >= 48 && bytes[offset] <= 57) offset += 1;
+            if (offset === start || bytes[offset] !== 58) throw new Error('无效的 bencode 字符串');
+            const length = Number.parseInt(decoder.decode(bytes.subarray(start, offset)), 10);
+            offset += 1 + length;
+            if (!Number.isSafeInteger(length) || length < 0 || offset > bytes.length) {
+                throw new Error('bencode 字符串长度越界');
+            }
+        }
+
+        function skipValue(depth = 0) {
+            if (depth > 100 || offset >= bytes.length) throw new Error('无效的 bencode 数据');
+            const token = bytes[offset];
+            if (token >= 48 && token <= 57) {
+                skipBytes();
+            } else if (token === 105) {
+                offset = bytes.indexOf(101, offset + 1);
+                if (offset < 0) throw new Error('未结束的 bencode 整数');
+                offset += 1;
+            } else if (token === 108 || token === 100) {
+                offset += 1;
+                while (offset < bytes.length && bytes[offset] !== 101) {
+                    if (token === 100) skipBytes();
+                    skipValue(depth + 1);
+                }
+                if (offset >= bytes.length) throw new Error('未结束的 bencode 容器');
+                offset += 1;
+            } else {
+                throw new Error('未知的 bencode 类型');
+            }
+        }
+
+        if (bytes[offset] !== 100) throw new Error('torrent 根节点不是字典');
+        offset += 1;
+        while (offset < bytes.length && bytes[offset] !== 101) {
+            const keyStart = offset;
+            skipBytes();
+            const colon = bytes.indexOf(58, keyStart);
+            const key = decoder.decode(bytes.subarray(colon + 1, offset));
+            const valueStart = offset;
+            skipValue(1);
+            if (key === 'info') return bytes.subarray(valueStart, offset);
+        }
+        throw new Error('torrent 中缺少 info 字典');
+    }
+
+    function sha1Hex(input) {
+        const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+        const paddedLength = Math.ceil((bytes.length + 9) / 64) * 64;
+        const padded = new Uint8Array(paddedLength);
+        padded.set(bytes);
+        padded[bytes.length] = 0x80;
+        const view = new DataView(padded.buffer);
+        const bitLength = bytes.length * 8;
+        view.setUint32(paddedLength - 8, Math.floor(bitLength / 0x100000000));
+        view.setUint32(paddedLength - 4, bitLength >>> 0);
+
+        let h0 = 0x67452301;
+        let h1 = 0xEFCDAB89;
+        let h2 = 0x98BADCFE;
+        let h3 = 0x10325476;
+        let h4 = 0xC3D2E1F0;
+        const words = new Uint32Array(80);
+        const rotateLeft = (value, bits) => (value << bits) | (value >>> (32 - bits));
+
+        for (let chunk = 0; chunk < paddedLength; chunk += 64) {
+            for (let index = 0; index < 16; index += 1) words[index] = view.getUint32(chunk + index * 4);
+            for (let index = 16; index < 80; index += 1) {
+                words[index] = rotateLeft(words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16], 1) >>> 0;
+            }
+            let a = h0;
+            let b = h1;
+            let c = h2;
+            let d = h3;
+            let e = h4;
+            for (let index = 0; index < 80; index += 1) {
+                let f;
+                let k;
+                if (index < 20) {
+                    f = (b & c) | (~b & d);
+                    k = 0x5A827999;
+                } else if (index < 40) {
+                    f = b ^ c ^ d;
+                    k = 0x6ED9EBA1;
+                } else if (index < 60) {
+                    f = (b & c) | (b & d) | (c & d);
+                    k = 0x8F1BBCDC;
+                } else {
+                    f = b ^ c ^ d;
+                    k = 0xCA62C1D6;
+                }
+                const temp = (rotateLeft(a, 5) + f + e + k + words[index]) >>> 0;
+                e = d;
+                d = c;
+                c = rotateLeft(b, 30) >>> 0;
+                b = a;
+                a = temp;
+            }
+            h0 = (h0 + a) >>> 0;
+            h1 = (h1 + b) >>> 0;
+            h2 = (h2 + c) >>> 0;
+            h3 = (h3 + d) >>> 0;
+            h4 = (h4 + e) >>> 0;
+        }
+        return [h0, h1, h2, h3, h4].map(value => value.toString(16).padStart(8, '0')).join('').toUpperCase();
+    }
+
+    async function verifyTorrentHash(input, expectedHash) {
+        const actualHash = sha1Hex(extractInfoBytes(input));
+        if (actualHash !== expectedHash.toUpperCase()) {
+            throw new Error(`torrent infohash 不匹配（期望 ${expectedHash}，实际 ${actualHash}）`);
+        }
+        return true;
+    }
+
     function sanitizeFilename(name) {
         const replacements = {
             '<': '＜', '>': '＞', ':': '：', '"': '＂', '/': '／', '\\': '＼',
@@ -222,6 +342,7 @@
             try {
                 const bytes = await requestTorrentUrl(url);
                 parseTorrentName(bytes);
+                await verifyTorrentHash(bytes, hash);
                 return bytes;
             } catch (error) {
                 errors.push(`${new URL(url).hostname}: ${error?.message || error}`);
@@ -246,35 +367,6 @@
         return filename;
     }
 
-    function fallbackDownloadUrl(url, hash) {
-        return new Promise((resolve, reject) => {
-            if (typeof GM_download !== 'function') {
-                reject(new Error('当前 userscript 管理器不支持 GM_download'));
-                return;
-            }
-            GM_download({
-                url,
-                name: `${hash}.torrent`,
-                saveAs: false,
-                onload: resolve,
-                onerror: reject,
-                ontimeout: reject,
-            });
-        });
-    }
-
-    async function fallbackDownload(hash) {
-        let lastError;
-        for (const url of torrentUrls(hash)) {
-            try {
-                await fallbackDownloadUrl(url, hash);
-                return;
-            } catch (error) {
-                lastError = error;
-            }
-        }
-        throw lastError || new Error('所有 torrent 缓存源均不可用');
-    }
 
     function injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
@@ -314,17 +406,9 @@
                 button.textContent = '✅ 已下载';
                 button.title = filename;
             } catch (error) {
-                console.warn('[磁力转种子] 无法读取实际名称，改用 hash 文件名下载：', error);
-                button.textContent = '⏳ 直接下载';
-                try {
-                    await fallbackDownload(hash);
-                    button.textContent = '✅ 已下载';
-                    button.title = `${hash}.torrent`;
-                } catch (fallbackError) {
-                    console.error('[磁力转种子] 下载失败：', fallbackError);
-                    button.textContent = '❌ 下载失败';
-                    button.title = fallbackError?.message || String(fallbackError);
-                }
+                console.error('[磁力转种子] 下载失败：', error);
+                button.textContent = '❌ 下载失败';
+                button.title = error?.message || String(error);
             } finally {
                 setTimeout(() => {
                     button.textContent = originalText;
@@ -481,6 +565,7 @@
             stop: () => observer.disconnect(),
             torrentFilename,
             torrentUrl,
+            verifyTorrentHash,
         };
     }
 
