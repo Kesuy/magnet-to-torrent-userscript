@@ -8,6 +8,23 @@
 
 需要先安装 [Tampermonkey](https://www.tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/)。
 
+## 3.2.0：aria2 RPC 设置与连接测试
+
+- 在 userscript 管理器菜单中增加 **⚙️ aria2 设置**，可配置 RPC 地址和可选的 `rpc-secret`。
+- 地址只允许 `http` / `https`；只填写主机和端口时会自动补全 `/jsonrpc`。
+- 增加 **🔌 测试 aria2 连接** 菜单，使用只读的 `aria2.getVersion` 检查地址、密钥和 RPC 服务状态。
+- 设置保存在 userscript 管理器的脚本专属存储中，不会写入网页或 URL。
+- 当前版本只提供 aria2 配置与连通性测试；种子下载仍使用下方的公共缓存源。
+
+### aria2 连接测试
+
+1. 在 aria2 中启用 JSON-RPC，例如监听本机 `127.0.0.1:6800`。
+2. 打开 Tampermonkey / Violentmonkey 的脚本菜单，选择 **⚙️ aria2 设置**。
+3. 填写 `http://127.0.0.1:6800/jsonrpc`；如果 aria2 配置了 `rpc-secret`，同时填写密钥。
+4. 点击 **测试连接**。成功时会显示 aria2 版本号和启用的功能。
+
+为了允许用户配置不同主机，脚本声明了 `@connect *`；代码只会在用户主动测试时向所填 RPC 地址发送 `aria2.getVersion` 请求。
+
 ## 3.1.2：校验 torrent 身份
 
 - 下载前重新计算 torrent `info` 字典的 SHA-1，并确认它与磁力链接中的 BTIH 完全一致。
@@ -63,7 +80,7 @@ npm install
 npm run check
 ```
 
-测试覆盖 Base32 转换、bencode 名称解析、Windows 安全文件名、实际名称下载、重复扫描、普通文本、代码块、排除元素和动态 DOM。
+测试覆盖 aria2 设置与连接测试、Base32 转换、bencode 名称解析、Windows 安全文件名、实际名称下载、重复扫描、普通文本、代码块、排除元素和动态 DOM。
 
 ## License
 

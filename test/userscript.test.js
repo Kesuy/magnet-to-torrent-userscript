@@ -37,6 +37,76 @@ function encode(value) {
 test('metadata 授权所有下载源及 iTorrents 重定向域名', () => {
     assert.match(source, /^\/\/ @connect\s+itorrents\.net$/m);
     assert.match(source, /^\/\/ @connect\s+torrage\.info$/m);
+    assert.match(source, /^\/\/ @connect\s+\*$/m);
+    assert.match(source, /^\/\/ @grant\s+GM_getValue$/m);
+    assert.match(source, /^\/\/ @grant\s+GM_setValue$/m);
+    assert.match(source, /^\/\/ @grant\s+GM_registerMenuCommand$/m);
+});
+
+test('规范化并持久化 aria2 RPC 设置', () => {
+    const stored = new Map();
+    const { dom, api } = boot('', {
+        GM_getValue(key, fallback) { return stored.has(key) ? stored.get(key) : fallback; },
+        GM_setValue(key, value) { stored.set(key, value); },
+    });
+
+    assert.deepEqual(JSON.parse(JSON.stringify(api.getAria2Settings())), {
+        url: 'http://127.0.0.1:6800/jsonrpc',
+        secret: '',
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(api.saveAria2Settings({ url: 'http://localhost:6800', secret: ' rpc-token ' }))), {
+        url: 'http://localhost:6800/jsonrpc',
+        secret: 'rpc-token',
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(api.getAria2Settings())), {
+        url: 'http://localhost:6800/jsonrpc',
+        secret: 'rpc-token',
+    });
+    assert.throws(() => api.normalizeAria2Url('file:///tmp/jsonrpc'), /仅支持 http 或 https/);
+    dom.window.close();
+});
+
+test('使用只读 getVersion 和密钥测试 aria2 连接', async () => {
+    let request;
+    const { dom, api } = boot('', {
+        GM_xmlhttpRequest(options) {
+            request = options;
+            queueMicrotask(() => options.onload({
+                status: 200,
+                response: {
+                    jsonrpc: '2.0',
+                    id: 'test',
+                    result: { version: '1.37.0', enabledFeatures: ['BitTorrent', 'GZip'] },
+                },
+            }));
+        },
+    });
+
+    const result = await api.testAria2Connection({ url: 'http://localhost:6800', secret: 'rpc-token' });
+    const payload = JSON.parse(request.data);
+    assert.equal(request.method, 'POST');
+    assert.equal(request.url, 'http://localhost:6800/jsonrpc');
+    assert.equal(request.responseType, 'json');
+    assert.equal(payload.method, 'aria2.getVersion');
+    assert.deepEqual(payload.params, ['token:rpc-token']);
+    assert.equal(result.version, '1.37.0');
+    assert.deepEqual([...result.enabledFeatures], ['BitTorrent', 'GZip']);
+    dom.window.close();
+});
+
+test('aria2 设置菜单可打开设置与测试对话框', () => {
+    const commands = [];
+    const { dom, document } = boot('', {
+        GM_registerMenuCommand(label, callback) { commands.push({ label, callback }); },
+    });
+
+    assert.deepEqual(commands.map(command => command.label), ['⚙️ aria2 设置', '🔌 测试 aria2 连接']);
+    commands[0].callback();
+    const dialog = document.querySelector('#mtt-aria2-dialog [role="dialog"]');
+    assert.ok(dialog);
+    assert.equal(dialog.querySelector('input[name="aria2-url"]').value, 'http://127.0.0.1:6800/jsonrpc');
+    assert.match(dialog.textContent, /aria2\.getVersion/);
+    dom.window.close();
 });
 
 test('将 32 位 Base32 BTIH 正确转换为 40 位十六进制', () => {

@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      3.1.2
+// @version      3.2.0
 // @description  识别页面中的磁力链接，按种子实际名称下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @connect      itorrents.net
 // @connect      itorrents.org
 // @connect      torrage.info
+// @connect      *
 // @run-at       document-end
 // @license      MIT
 // @updateURL    https://raw.githubusercontent.com/Kesuy/magnet-to-torrent-userscript/main/magnet-to-torrent.user.js
@@ -26,11 +30,18 @@
         ]),
         buttonText: '📥 种子',
         debounceMs: 180,
+        aria2: Object.freeze({
+            defaultUrl: 'http://127.0.0.1:6800/jsonrpc',
+            requestTimeoutMs: 10000,
+            urlStorageKey: 'mtt-aria2-rpc-url',
+            secretStorageKey: 'mtt-aria2-rpc-secret',
+        }),
     });
 
     const OWNED_ATTR = 'data-mtt-owned';
     const PROCESSED_ATTR = 'data-mtt-processed';
     const STYLE_ID = 'mtt-styles';
+    const ARIA2_DIALOG_ID = 'mtt-aria2-dialog';
     const CODE_SELECTOR = 'pre, code, div.blockcode';
     const SKIP_SELECTOR = `a, button, script, style, textarea, input, select, option, [contenteditable], [${OWNED_ATTR}]`;
     const BTIH_REGEX = /urn:btih:([a-f\d]{40}|[a-z2-7]{32})/i;
@@ -75,6 +86,122 @@
 
     function torrentUrls(hash) {
         return CONFIG.torrentSources.map(buildUrl => buildUrl(hash));
+    }
+
+    function normalizeAria2Url(value) {
+        const raw = String(value || '').trim();
+        if (!raw) throw new Error('请输入 aria2 RPC 地址');
+
+        let url;
+        try {
+            url = new URL(raw);
+        } catch {
+            throw new Error('aria2 RPC 地址格式无效');
+        }
+        if (!['http:', 'https:'].includes(url.protocol)) {
+            throw new Error('aria2 RPC 地址仅支持 http 或 https');
+        }
+        if (url.username || url.password) {
+            throw new Error('请不要把用户名或密码写入 aria2 RPC 地址');
+        }
+        if (!url.hostname) throw new Error('aria2 RPC 地址缺少主机名');
+        if (url.pathname === '/' || !url.pathname) url.pathname = '/jsonrpc';
+        url.hash = '';
+        return url.toString();
+    }
+
+    function getStoredValue(key, fallback) {
+        if (typeof GM_getValue !== 'function') return fallback;
+        return GM_getValue(key, fallback);
+    }
+
+    function setStoredValue(key, value) {
+        if (typeof GM_setValue !== 'function') {
+            throw new Error('当前 userscript 管理器不支持保存设置');
+        }
+        GM_setValue(key, value);
+    }
+
+    function getAria2Settings() {
+        const url = getStoredValue(CONFIG.aria2.urlStorageKey, CONFIG.aria2.defaultUrl);
+        const secret = getStoredValue(CONFIG.aria2.secretStorageKey, '');
+        return { url: String(url || CONFIG.aria2.defaultUrl), secret: String(secret || '') };
+    }
+
+    function saveAria2Settings(settings) {
+        const normalized = {
+            url: normalizeAria2Url(settings?.url),
+            secret: String(settings?.secret || '').trim(),
+        };
+        setStoredValue(CONFIG.aria2.urlStorageKey, normalized.url);
+        setStoredValue(CONFIG.aria2.secretStorageKey, normalized.secret);
+        return normalized;
+    }
+
+    function requestAria2(method, params = [], settings = getAria2Settings()) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                reject(new Error('当前 userscript 管理器不支持 GM_xmlhttpRequest'));
+                return;
+            }
+
+            let url;
+            try {
+                url = normalizeAria2Url(settings.url);
+            } catch (error) {
+                reject(error);
+                return;
+            }
+            const secret = String(settings.secret || '').trim();
+            const rpcParams = secret ? [`token:${secret}`, ...params] : [...params];
+            const requestId = `mtt-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url,
+                headers: { 'Content-Type': 'application/json' },
+                data: JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params: rpcParams }),
+                responseType: 'json',
+                timeout: CONFIG.aria2.requestTimeoutMs,
+                anonymous: true,
+                onload(response) {
+                    if (response.status < 200 || response.status >= 300) {
+                        reject(new Error(`aria2 连接失败（HTTP ${response.status}）`));
+                        return;
+                    }
+                    let body = response.response;
+                    if (!body && response.responseText) {
+                        try {
+                            body = JSON.parse(response.responseText);
+                        } catch {
+                            reject(new Error('aria2 返回的不是有效 JSON'));
+                            return;
+                        }
+                    }
+                    if (!body || typeof body !== 'object') {
+                        reject(new Error('aria2 返回内容为空'));
+                        return;
+                    }
+                    if (body.error) {
+                        const code = body.error.code ?? '未知';
+                        reject(new Error(`aria2 RPC 错误 ${code}：${body.error.message || '未知错误'}`));
+                        return;
+                    }
+                    resolve(body.result);
+                },
+                onerror: () => reject(new Error('无法连接 aria2，请检查地址、服务状态和跨域权限')),
+                ontimeout: () => reject(new Error('连接 aria2 超时')),
+            });
+        });
+    }
+
+    async function testAria2Connection(settings = getAria2Settings()) {
+        const result = await requestAria2('aria2.getVersion', [], settings);
+        if (!result?.version) throw new Error('aria2 已响应，但未返回版本号');
+        return {
+            version: String(result.version),
+            enabledFeatures: Array.isArray(result.enabledFeatures) ? result.enabledFeatures : [],
+        };
     }
 
     function trimMagnet(raw) {
@@ -380,8 +507,143 @@
             .mtt-button:hover, .mtt-button:focus-visible { background:#218838 !important; }
             .mtt-magnet { overflow-wrap:anywhere; }
             .mtt-code-buttons { display:block; margin-top:4px; }
+            .mtt-aria2-overlay { position:fixed; inset:0; z-index:2147483647; display:flex; align-items:center;
+                justify-content:center; padding:20px; background:rgba(0,0,0,.5); font:14px/1.5 sans-serif; }
+            .mtt-aria2-panel { width:min(520px, 100%); box-sizing:border-box; padding:20px; border-radius:10px;
+                background:#fff; color:#222; box-shadow:0 12px 40px rgba(0,0,0,.3); }
+            .mtt-aria2-panel h2 { margin:0 0 8px; font-size:20px; }
+            .mtt-aria2-panel p { margin:0 0 14px; color:#555; }
+            .mtt-aria2-field { display:block; margin:12px 0; font-weight:600; }
+            .mtt-aria2-field input { display:block; width:100%; box-sizing:border-box; margin-top:5px; padding:8px 10px;
+                border:1px solid #bbb; border-radius:5px; background:#fff; color:#222; font:14px/1.4 monospace; }
+            .mtt-aria2-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+            .mtt-aria2-actions button { padding:7px 14px; border:1px solid #aaa; border-radius:5px; cursor:pointer; }
+            .mtt-aria2-actions button[type="submit"] { border-color:#1677ff; background:#1677ff; color:#fff; }
+            .mtt-aria2-status { min-height:21px; margin-top:12px; color:#555; overflow-wrap:anywhere; }
+            .mtt-aria2-status[data-kind="success"] { color:#16803c; }
+            .mtt-aria2-status[data-kind="error"] { color:#c5221f; }
         `;
         (document.head || document.documentElement).appendChild(style);
+    }
+
+    function openAria2Settings() {
+        if (!document.body) throw new Error('页面尚未加载完成');
+        document.getElementById(ARIA2_DIALOG_ID)?.remove();
+        injectStyles();
+
+        const current = getAria2Settings();
+        const overlay = document.createElement('div');
+        overlay.id = ARIA2_DIALOG_ID;
+        overlay.className = 'mtt-aria2-overlay';
+        overlay.setAttribute(OWNED_ATTR, '');
+
+        const panel = document.createElement('form');
+        panel.className = 'mtt-aria2-panel';
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-modal', 'true');
+        panel.setAttribute('aria-labelledby', 'mtt-aria2-title');
+
+        const title = document.createElement('h2');
+        title.id = 'mtt-aria2-title';
+        title.textContent = 'aria2 RPC 设置';
+        const description = document.createElement('p');
+        description.textContent = '测试连接只调用只读方法 aria2.getVersion，不会添加下载任务。';
+
+        const urlLabel = document.createElement('label');
+        urlLabel.className = 'mtt-aria2-field';
+        urlLabel.textContent = 'RPC 地址';
+        const urlInput = document.createElement('input');
+        urlInput.name = 'aria2-url';
+        urlInput.type = 'url';
+        urlInput.required = true;
+        urlInput.value = current.url;
+        urlInput.placeholder = CONFIG.aria2.defaultUrl;
+        urlInput.autocomplete = 'url';
+        urlLabel.appendChild(urlInput);
+
+        const secretLabel = document.createElement('label');
+        secretLabel.className = 'mtt-aria2-field';
+        secretLabel.textContent = 'RPC 密钥（可选）';
+        const secretInput = document.createElement('input');
+        secretInput.name = 'aria2-secret';
+        secretInput.type = 'password';
+        secretInput.value = current.secret;
+        secretInput.placeholder = '对应 aria2 的 rpc-secret';
+        secretInput.autocomplete = 'off';
+        secretLabel.appendChild(secretInput);
+
+        const status = document.createElement('div');
+        status.className = 'mtt-aria2-status';
+        status.setAttribute('aria-live', 'polite');
+        const setStatus = (message, kind = '') => {
+            status.textContent = message;
+            status.dataset.kind = kind;
+        };
+        const formSettings = () => ({ url: urlInput.value, secret: secretInput.value });
+
+        const actions = document.createElement('div');
+        actions.className = 'mtt-aria2-actions';
+        const saveButton = document.createElement('button');
+        saveButton.type = 'submit';
+        saveButton.textContent = '保存';
+        const testButton = document.createElement('button');
+        testButton.type = 'button';
+        testButton.textContent = '测试连接';
+        const closeButton = document.createElement('button');
+        closeButton.type = 'button';
+        closeButton.textContent = '关闭';
+        actions.append(saveButton, testButton, closeButton);
+
+        const close = () => overlay.remove();
+        closeButton.addEventListener('click', close);
+        overlay.addEventListener('click', event => {
+            if (event.target === overlay) close();
+        });
+        panel.addEventListener('submit', event => {
+            event.preventDefault();
+            try {
+                const saved = saveAria2Settings(formSettings());
+                urlInput.value = saved.url;
+                secretInput.value = saved.secret;
+                setStatus('设置已保存。', 'success');
+            } catch (error) {
+                setStatus(error?.message || String(error), 'error');
+            }
+        });
+        testButton.addEventListener('click', async () => {
+            testButton.disabled = true;
+            setStatus('正在连接 aria2…');
+            try {
+                const result = await testAria2Connection(formSettings());
+                const features = result.enabledFeatures.length ? `；功能：${result.enabledFeatures.join(', ')}` : '';
+                setStatus(`连接成功，aria2 ${result.version}${features}`, 'success');
+            } catch (error) {
+                setStatus(error?.message || String(error), 'error');
+            } finally {
+                testButton.disabled = false;
+            }
+        });
+
+        panel.append(title, description, urlLabel, secretLabel, actions, status);
+        overlay.appendChild(panel);
+        document.body.appendChild(overlay);
+        urlInput.focus();
+        return overlay;
+    }
+
+    async function showAria2ConnectionResult() {
+        try {
+            const result = await testAria2Connection();
+            globalThis.alert?.(`aria2 连接成功\n版本：${result.version}`);
+        } catch (error) {
+            globalThis.alert?.(`aria2 连接失败\n${error?.message || error}`);
+        }
+    }
+
+    function registerAria2MenuCommands() {
+        if (typeof GM_registerMenuCommand !== 'function') return;
+        GM_registerMenuCommand('⚙️ aria2 设置', openAria2Settings);
+        GM_registerMenuCommand('🔌 测试 aria2 连接', showAria2ConnectionResult);
     }
 
     function createTorrentButton(hash) {
@@ -558,16 +820,23 @@
             downloadTorrent,
             extractHash,
             findMagnets,
+            getAria2Settings,
             normalizeHash,
+            normalizeAria2Url,
+            openAria2Settings,
             parseTorrentName,
+            requestAria2,
             requestTorrent,
+            saveAria2Settings,
             scan,
             stop: () => observer.disconnect(),
+            testAria2Connection,
             torrentFilename,
             torrentUrl,
             verifyTorrentHash,
         };
     }
 
+    registerAria2MenuCommands();
     start();
 })();
