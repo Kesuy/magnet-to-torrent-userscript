@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      3.2.0
-// @description  识别页面中的磁力链接，按种子实际名称下载 .torrent 文件
+// @version      4.0.0
+// @description  识别页面中的磁力链接，通过公共缓存或 qBittorrent 元数据解析下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -12,6 +12,7 @@
 // @connect      itorrents.net
 // @connect      itorrents.org
 // @connect      torrage.info
+// @connect      btcache.me
 // @connect      *
 // @run-at       document-end
 // @license      MIT
@@ -27,21 +28,27 @@
             hash => `https://itorrents.net/torrent/${hash}.torrent`,
             hash => `https://torrage.info/torrent/${hash}.torrent`,
             hash => `https://itorrents.org/torrent/${hash}.torrent`,
+            hash => `https://btcache.me/torrent/${hash}`,
         ]),
+        cacheRequestTimeoutMs: 8000,
         buttonText: '📥 种子',
         debounceMs: 180,
-        aria2: Object.freeze({
-            defaultUrl: 'http://127.0.0.1:6800/jsonrpc',
+        qbittorrent: Object.freeze({
+            defaultUrl: 'http://127.0.0.1:8080',
             requestTimeoutMs: 10000,
-            urlStorageKey: 'mtt-aria2-rpc-url',
-            secretStorageKey: 'mtt-aria2-rpc-secret',
+            metadataTimeoutMs: 60000,
+            pollIntervalMs: 2000,
+            enabledStorageKey: 'mtt-qb-enabled',
+            urlStorageKey: 'mtt-qb-url',
+            apiKeyStorageKey: 'mtt-qb-api-key',
+            metadataTimeoutStorageKey: 'mtt-qb-metadata-timeout-ms',
         }),
     });
 
     const OWNED_ATTR = 'data-mtt-owned';
     const PROCESSED_ATTR = 'data-mtt-processed';
     const STYLE_ID = 'mtt-styles';
-    const ARIA2_DIALOG_ID = 'mtt-aria2-dialog';
+    const QB_DIALOG_ID = 'mtt-qb-dialog';
     const CODE_SELECTOR = 'pre, code, div.blockcode';
     const SKIP_SELECTOR = `a, button, script, style, textarea, input, select, option, [contenteditable], [${OWNED_ATTR}]`;
     const BTIH_REGEX = /urn:btih:([a-f\d]{40}|[a-z2-7]{32})/i;
@@ -88,28 +95,6 @@
         return CONFIG.torrentSources.map(buildUrl => buildUrl(hash));
     }
 
-    function normalizeAria2Url(value) {
-        const raw = String(value || '').trim();
-        if (!raw) throw new Error('请输入 aria2 RPC 地址');
-
-        let url;
-        try {
-            url = new URL(raw);
-        } catch {
-            throw new Error('aria2 RPC 地址格式无效');
-        }
-        if (!['http:', 'https:'].includes(url.protocol)) {
-            throw new Error('aria2 RPC 地址仅支持 http 或 https');
-        }
-        if (url.username || url.password) {
-            throw new Error('请不要把用户名或密码写入 aria2 RPC 地址');
-        }
-        if (!url.hostname) throw new Error('aria2 RPC 地址缺少主机名');
-        if (url.pathname === '/' || !url.pathname) url.pathname = '/jsonrpc';
-        url.hash = '';
-        return url.toString();
-    }
-
     function getStoredValue(key, fallback) {
         if (typeof GM_getValue !== 'function') return fallback;
         return GM_getValue(key, fallback);
@@ -122,23 +107,86 @@
         GM_setValue(key, value);
     }
 
-    function getAria2Settings() {
-        const url = getStoredValue(CONFIG.aria2.urlStorageKey, CONFIG.aria2.defaultUrl);
-        const secret = getStoredValue(CONFIG.aria2.secretStorageKey, '');
-        return { url: String(url || CONFIG.aria2.defaultUrl), secret: String(secret || '') };
+    function normalizeQbUrl(value) {
+        const raw = String(value || '').trim();
+        if (!raw) throw new Error('请输入 qBittorrent WebUI 地址');
+
+        let url;
+        try {
+            url = new URL(raw);
+        } catch {
+            throw new Error('qBittorrent WebUI 地址格式无效');
+        }
+        if (!['http:', 'https:'].includes(url.protocol)) {
+            throw new Error('qBittorrent WebUI 地址仅支持 http 或 https');
+        }
+        if (url.username || url.password) {
+            throw new Error('请不要把用户名或密码写入 WebUI 地址');
+        }
+        if (!url.hostname) throw new Error('qBittorrent WebUI 地址缺少主机名');
+        url.search = '';
+        url.hash = '';
+        url.pathname = url.pathname.replace(/\/+$/, '');
+        return url.toString().replace(/\/$/, '');
     }
 
-    function saveAria2Settings(settings) {
-        const normalized = {
-            url: normalizeAria2Url(settings?.url),
-            secret: String(settings?.secret || '').trim(),
+    function getQbSettings() {
+        const rawTimeout = Number(getStoredValue(
+            CONFIG.qbittorrent.metadataTimeoutStorageKey,
+            CONFIG.qbittorrent.metadataTimeoutMs,
+        ));
+        return {
+            enabled: getStoredValue(CONFIG.qbittorrent.enabledStorageKey, false) === true,
+            url: String(getStoredValue(CONFIG.qbittorrent.urlStorageKey, CONFIG.qbittorrent.defaultUrl)
+                || CONFIG.qbittorrent.defaultUrl),
+            apiKey: String(getStoredValue(CONFIG.qbittorrent.apiKeyStorageKey, '') || ''),
+            metadataTimeoutMs: Number.isFinite(rawTimeout)
+                ? Math.min(300000, Math.max(10000, Math.round(rawTimeout)))
+                : CONFIG.qbittorrent.metadataTimeoutMs,
         };
-        setStoredValue(CONFIG.aria2.urlStorageKey, normalized.url);
-        setStoredValue(CONFIG.aria2.secretStorageKey, normalized.secret);
+    }
+
+    function saveQbSettings(settings) {
+        const timeout = Number(settings?.metadataTimeoutMs ?? CONFIG.qbittorrent.metadataTimeoutMs);
+        if (!Number.isFinite(timeout) || timeout < 10000 || timeout > 300000) {
+            throw new Error('元数据等待时间需在 10～300 秒之间');
+        }
+        const normalized = {
+            enabled: Boolean(settings?.enabled),
+            url: normalizeQbUrl(settings?.url),
+            apiKey: String(settings?.apiKey || '').trim(),
+            metadataTimeoutMs: Math.round(timeout),
+        };
+        setStoredValue(CONFIG.qbittorrent.enabledStorageKey, normalized.enabled);
+        setStoredValue(CONFIG.qbittorrent.urlStorageKey, normalized.url);
+        setStoredValue(CONFIG.qbittorrent.apiKeyStorageKey, normalized.apiKey);
+        setStoredValue(CONFIG.qbittorrent.metadataTimeoutStorageKey, normalized.metadataTimeoutMs);
         return normalized;
     }
 
-    function requestAria2(method, params = [], settings = getAria2Settings()) {
+    function qbEndpoint(path, settings = getQbSettings()) {
+        const base = normalizeQbUrl(settings.url);
+        return `${base}${path.startsWith('/') ? path : `/${path}`}`;
+    }
+
+    function qbErrorMessage(response, path) {
+        const body = String(response?.responseText || '').trim();
+        if (response?.status === 401 || response?.status === 403) {
+            return 'qBittorrent 拒绝访问；请配置 WebUI API Key，或确认该地址允许当前客户端免认证';
+        }
+        if (response?.status === 404 && path.includes('/torrents/')) {
+            return 'qBittorrent 未提供元数据 API；请使用支持 WebAPI 2.11.9+ 的版本';
+        }
+        return `qBittorrent 请求失败（HTTP ${response?.status ?? '未知'}）${body ? `：${body}` : ''}`;
+    }
+
+    function requestQb(path, {
+        method = 'GET',
+        responseType = 'text',
+        timeout = CONFIG.qbittorrent.requestTimeoutMs,
+        allowedStatuses = [200],
+        settings = getQbSettings(),
+    } = {}) {
         return new Promise((resolve, reject) => {
             if (typeof GM_xmlhttpRequest !== 'function') {
                 reject(new Error('当前 userscript 管理器不支持 GM_xmlhttpRequest'));
@@ -147,61 +195,46 @@
 
             let url;
             try {
-                url = normalizeAria2Url(settings.url);
+                url = qbEndpoint(path, settings);
             } catch (error) {
                 reject(error);
                 return;
             }
-            const secret = String(settings.secret || '').trim();
-            const rpcParams = secret ? [`token:${secret}`, ...params] : [...params];
-            const requestId = `mtt-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+            const headers = {};
+            if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
 
             GM_xmlhttpRequest({
-                method: 'POST',
+                method,
                 url,
-                headers: { 'Content-Type': 'application/json' },
-                data: JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params: rpcParams }),
-                responseType: 'json',
-                timeout: CONFIG.aria2.requestTimeoutMs,
+                headers,
+                responseType,
+                timeout,
                 anonymous: true,
                 onload(response) {
-                    if (response.status < 200 || response.status >= 300) {
-                        reject(new Error(`aria2 连接失败（HTTP ${response.status}）`));
+                    if (!allowedStatuses.includes(response.status)) {
+                        const error = new Error(qbErrorMessage(response, path));
+                        error.status = response.status;
+                        reject(error);
                         return;
                     }
-                    let body = response.response;
-                    if (!body && response.responseText) {
-                        try {
-                            body = JSON.parse(response.responseText);
-                        } catch {
-                            reject(new Error('aria2 返回的不是有效 JSON'));
-                            return;
-                        }
-                    }
-                    if (!body || typeof body !== 'object') {
-                        reject(new Error('aria2 返回内容为空'));
-                        return;
-                    }
-                    if (body.error) {
-                        const code = body.error.code ?? '未知';
-                        reject(new Error(`aria2 RPC 错误 ${code}：${body.error.message || '未知错误'}`));
-                        return;
-                    }
-                    resolve(body.result);
+                    resolve(response);
                 },
-                onerror: () => reject(new Error('无法连接 aria2，请检查地址、服务状态和跨域权限')),
-                ontimeout: () => reject(new Error('连接 aria2 超时')),
+                onerror: () => reject(new Error('无法连接 qBittorrent，请检查 WebUI 地址、服务状态和 userscript 跨域权限')),
+                ontimeout: () => reject(new Error('连接 qBittorrent 超时')),
             });
         });
     }
 
-    async function testAria2Connection(settings = getAria2Settings()) {
-        const result = await requestAria2('aria2.getVersion', [], settings);
-        if (!result?.version) throw new Error('aria2 已响应，但未返回版本号');
-        return {
-            version: String(result.version),
-            enabledFeatures: Array.isArray(result.enabledFeatures) ? result.enabledFeatures : [],
-        };
+    async function testQbConnection(settings = getQbSettings()) {
+        const response = await requestQb('/api/v2/app/version', { settings, responseType: 'text' });
+        const version = String(response.responseText || response.response || '').trim();
+        if (!version) throw new Error('qBittorrent 已响应，但未返回版本号');
+        return { version };
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     function trimMagnet(raw) {
@@ -448,7 +481,7 @@
                 method: 'GET',
                 url,
                 responseType: 'arraybuffer',
-                timeout: 30000,
+                timeout: CONFIG.cacheRequestTimeoutMs,
                 anonymous: true,
                 onload(response) {
                     if (response.status < 200 || response.status >= 300 || !response.response) {
@@ -463,7 +496,7 @@
         });
     }
 
-    async function requestTorrent(hash) {
+    async function requestTorrentFromCaches(hash) {
         const errors = [];
         for (const url of torrentUrls(hash)) {
             try {
@@ -475,11 +508,73 @@
                 errors.push(`${new URL(url).hostname}: ${error?.message || error}`);
             }
         }
-        throw new Error(`所有 torrent 缓存源均不可用：${errors.join('；')}`);
+        const error = new Error(`所有 torrent 缓存源均不可用：${errors.join('；')}`);
+        error.cacheErrors = errors;
+        throw error;
     }
 
-    async function downloadTorrent(hash) {
-        const bytes = await requestTorrent(hash);
+    async function requestTorrentViaQbittorrent(hash, magnet = '', settings = getQbSettings()) {
+        if (!settings.enabled) throw new Error('qBittorrent 回退未启用');
+
+        const source = magnet && extractHash(magnet) === hash.toUpperCase()
+            ? magnet
+            : `magnet:?xt=urn:btih:${hash}`;
+        const query = `source=${encodeURIComponent(source)}`;
+        const deadline = Date.now() + settings.metadataTimeoutMs;
+        const fetchPath = `/api/v2/torrents/fetchMetadata?${query}`;
+        const savePath = `/api/v2/torrents/saveMetadata?${query}`;
+
+        while (Date.now() < deadline) {
+            const remaining = Math.max(1000, deadline - Date.now());
+            const response = await requestQb(fetchPath, {
+                settings,
+                responseType: 'text',
+                timeout: Math.min(CONFIG.qbittorrent.requestTimeoutMs, remaining),
+                allowedStatuses: [200, 202],
+            });
+            if (response.status === 200) {
+                const saved = await requestQb(savePath, {
+                    settings,
+                    responseType: 'arraybuffer',
+                    timeout: Math.min(CONFIG.qbittorrent.requestTimeoutMs, remaining),
+                    allowedStatuses: [200, 409],
+                });
+                if (saved.status === 200 && saved.response) {
+                    const bytes = new Uint8Array(saved.response);
+                    parseTorrentName(bytes);
+                    await verifyTorrentHash(bytes, hash);
+                    return bytes;
+                }
+            }
+            const delay = Math.min(CONFIG.qbittorrent.pollIntervalMs, Math.max(0, deadline - Date.now()));
+            if (delay > 0) await sleep(delay);
+        }
+
+        throw new Error(`qBittorrent 在 ${Math.round(settings.metadataTimeoutMs / 1000)} 秒内未获取到元数据（可能没有可用的 DHT/Peer）`);
+    }
+
+    async function requestTorrent(hash, magnet = '', onStage = () => {}) {
+        let cacheError;
+        onStage('cache');
+        try {
+            return await requestTorrentFromCaches(hash);
+        } catch (error) {
+            cacheError = error;
+        }
+
+        const settings = getQbSettings();
+        if (!settings.enabled) throw cacheError;
+
+        onStage('qbittorrent');
+        try {
+            return await requestTorrentViaQbittorrent(hash, magnet, settings);
+        } catch (qbError) {
+            throw new Error(`${cacheError.message}；qBittorrent：${qbError?.message || qbError}`);
+        }
+    }
+
+    async function downloadTorrent(hash, magnet = '', onStage = () => {}) {
+        const bytes = await requestTorrent(hash, magnet, onStage);
         const filename = torrentFilename(bytes, hash);
         const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/x-bittorrent' }));
         const anchor = document.createElement('a');
@@ -494,7 +589,6 @@
         return filename;
     }
 
-
     function injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
         const style = document.createElement('style');
@@ -507,82 +601,110 @@
             .mtt-button:hover, .mtt-button:focus-visible { background:#218838 !important; }
             .mtt-magnet { overflow-wrap:anywhere; }
             .mtt-code-buttons { display:block; margin-top:4px; }
-            .mtt-aria2-overlay { position:fixed; inset:0; z-index:2147483647; display:flex; align-items:center;
+            .mtt-qb-overlay { position:fixed; inset:0; z-index:2147483647; display:flex; align-items:center;
                 justify-content:center; padding:20px; background:rgba(0,0,0,.5); font:14px/1.5 sans-serif; }
-            .mtt-aria2-panel { width:min(520px, 100%); box-sizing:border-box; padding:20px; border-radius:10px;
+            .mtt-qb-panel { width:min(560px, 100%); box-sizing:border-box; padding:20px; border-radius:10px;
                 background:#fff; color:#222; box-shadow:0 12px 40px rgba(0,0,0,.3); }
-            .mtt-aria2-panel h2 { margin:0 0 8px; font-size:20px; }
-            .mtt-aria2-panel p { margin:0 0 14px; color:#555; }
-            .mtt-aria2-field { display:block; margin:12px 0; font-weight:600; }
-            .mtt-aria2-field input { display:block; width:100%; box-sizing:border-box; margin-top:5px; padding:8px 10px;
+            .mtt-qb-panel h2 { margin:0 0 8px; font-size:20px; }
+            .mtt-qb-panel p { margin:0 0 14px; color:#555; }
+            .mtt-qb-field { display:block; margin:12px 0; font-weight:600; }
+            .mtt-qb-field input[type="url"], .mtt-qb-field input[type="password"], .mtt-qb-field input[type="number"] {
+                display:block; width:100%; box-sizing:border-box; margin-top:5px; padding:8px 10px;
                 border:1px solid #bbb; border-radius:5px; background:#fff; color:#222; font:14px/1.4 monospace; }
-            .mtt-aria2-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
-            .mtt-aria2-actions button { padding:7px 14px; border:1px solid #aaa; border-radius:5px; cursor:pointer; }
-            .mtt-aria2-actions button[type="submit"] { border-color:#1677ff; background:#1677ff; color:#fff; }
-            .mtt-aria2-status { min-height:21px; margin-top:12px; color:#555; overflow-wrap:anywhere; }
-            .mtt-aria2-status[data-kind="success"] { color:#16803c; }
-            .mtt-aria2-status[data-kind="error"] { color:#c5221f; }
+            .mtt-qb-check { display:flex; gap:8px; align-items:center; margin:12px 0; font-weight:600; }
+            .mtt-qb-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+            .mtt-qb-actions button { padding:7px 14px; border:1px solid #aaa; border-radius:5px; cursor:pointer; }
+            .mtt-qb-actions button[type="submit"] { border-color:#1677ff; background:#1677ff; color:#fff; }
+            .mtt-qb-status { min-height:21px; margin-top:12px; color:#555; overflow-wrap:anywhere; }
+            .mtt-qb-status[data-kind="success"] { color:#16803c; }
+            .mtt-qb-status[data-kind="error"] { color:#c5221f; }
         `;
         (document.head || document.documentElement).appendChild(style);
     }
 
-    function openAria2Settings() {
+    function openQbSettings() {
         if (!document.body) throw new Error('页面尚未加载完成');
-        document.getElementById(ARIA2_DIALOG_ID)?.remove();
+        document.getElementById(QB_DIALOG_ID)?.remove();
         injectStyles();
 
-        const current = getAria2Settings();
+        const current = getQbSettings();
         const overlay = document.createElement('div');
-        overlay.id = ARIA2_DIALOG_ID;
-        overlay.className = 'mtt-aria2-overlay';
+        overlay.id = QB_DIALOG_ID;
+        overlay.className = 'mtt-qb-overlay';
         overlay.setAttribute(OWNED_ATTR, '');
 
         const panel = document.createElement('form');
-        panel.className = 'mtt-aria2-panel';
+        panel.className = 'mtt-qb-panel';
         panel.setAttribute('role', 'dialog');
         panel.setAttribute('aria-modal', 'true');
-        panel.setAttribute('aria-labelledby', 'mtt-aria2-title');
+        panel.setAttribute('aria-labelledby', 'mtt-qb-title');
 
         const title = document.createElement('h2');
-        title.id = 'mtt-aria2-title';
-        title.textContent = 'aria2 RPC 设置';
+        title.id = 'mtt-qb-title';
+        title.textContent = 'qBittorrent 元数据回退设置';
         const description = document.createElement('p');
-        description.textContent = '测试连接只调用只读方法 aria2.getVersion，不会添加下载任务。';
+        description.textContent = '公共缓存均失败后，脚本可调用 qBittorrent WebAPI 从 DHT/Peer 获取元数据。推荐配置 WebUI API Key；此流程不会把任务添加到下载列表。';
+
+        const enabledLabel = document.createElement('label');
+        enabledLabel.className = 'mtt-qb-check';
+        const enabledInput = document.createElement('input');
+        enabledInput.name = 'qb-enabled';
+        enabledInput.type = 'checkbox';
+        enabledInput.checked = current.enabled;
+        enabledLabel.append(enabledInput, document.createTextNode('启用 qBittorrent 回退'));
 
         const urlLabel = document.createElement('label');
-        urlLabel.className = 'mtt-aria2-field';
-        urlLabel.textContent = 'RPC 地址';
+        urlLabel.className = 'mtt-qb-field';
+        urlLabel.textContent = 'WebUI 地址';
         const urlInput = document.createElement('input');
-        urlInput.name = 'aria2-url';
+        urlInput.name = 'qb-url';
         urlInput.type = 'url';
         urlInput.required = true;
         urlInput.value = current.url;
-        urlInput.placeholder = CONFIG.aria2.defaultUrl;
+        urlInput.placeholder = CONFIG.qbittorrent.defaultUrl;
         urlInput.autocomplete = 'url';
         urlLabel.appendChild(urlInput);
 
-        const secretLabel = document.createElement('label');
-        secretLabel.className = 'mtt-aria2-field';
-        secretLabel.textContent = 'RPC 密钥（可选）';
-        const secretInput = document.createElement('input');
-        secretInput.name = 'aria2-secret';
-        secretInput.type = 'password';
-        secretInput.value = current.secret;
-        secretInput.placeholder = '对应 aria2 的 rpc-secret';
-        secretInput.autocomplete = 'off';
-        secretLabel.appendChild(secretInput);
+        const apiKeyLabel = document.createElement('label');
+        apiKeyLabel.className = 'mtt-qb-field';
+        apiKeyLabel.textContent = 'WebUI API Key（推荐）';
+        const apiKeyInput = document.createElement('input');
+        apiKeyInput.name = 'qb-api-key';
+        apiKeyInput.type = 'password';
+        apiKeyInput.value = current.apiKey;
+        apiKeyInput.placeholder = 'Bearer API Key；本机免认证时可留空';
+        apiKeyInput.autocomplete = 'off';
+        apiKeyLabel.appendChild(apiKeyInput);
+
+        const timeoutLabel = document.createElement('label');
+        timeoutLabel.className = 'mtt-qb-field';
+        timeoutLabel.textContent = '等待元数据（秒）';
+        const timeoutInput = document.createElement('input');
+        timeoutInput.name = 'qb-timeout';
+        timeoutInput.type = 'number';
+        timeoutInput.min = '10';
+        timeoutInput.max = '300';
+        timeoutInput.step = '1';
+        timeoutInput.required = true;
+        timeoutInput.value = String(Math.round(current.metadataTimeoutMs / 1000));
+        timeoutLabel.appendChild(timeoutInput);
 
         const status = document.createElement('div');
-        status.className = 'mtt-aria2-status';
+        status.className = 'mtt-qb-status';
         status.setAttribute('aria-live', 'polite');
         const setStatus = (message, kind = '') => {
             status.textContent = message;
             status.dataset.kind = kind;
         };
-        const formSettings = () => ({ url: urlInput.value, secret: secretInput.value });
+        const formSettings = () => ({
+            enabled: enabledInput.checked,
+            url: urlInput.value,
+            apiKey: apiKeyInput.value,
+            metadataTimeoutMs: Number(timeoutInput.value) * 1000,
+        });
 
         const actions = document.createElement('div');
-        actions.className = 'mtt-aria2-actions';
+        actions.className = 'mtt-qb-actions';
         const saveButton = document.createElement('button');
         saveButton.type = 'submit';
         saveButton.textContent = '保存';
@@ -602,9 +724,11 @@
         panel.addEventListener('submit', event => {
             event.preventDefault();
             try {
-                const saved = saveAria2Settings(formSettings());
+                const saved = saveQbSettings(formSettings());
+                enabledInput.checked = saved.enabled;
                 urlInput.value = saved.url;
-                secretInput.value = saved.secret;
+                apiKeyInput.value = saved.apiKey;
+                timeoutInput.value = String(Math.round(saved.metadataTimeoutMs / 1000));
                 setStatus('设置已保存。', 'success');
             } catch (error) {
                 setStatus(error?.message || String(error), 'error');
@@ -612,11 +736,15 @@
         });
         testButton.addEventListener('click', async () => {
             testButton.disabled = true;
-            setStatus('正在连接 aria2…');
+            setStatus('正在连接 qBittorrent…');
             try {
-                const result = await testAria2Connection(formSettings());
-                const features = result.enabledFeatures.length ? `；功能：${result.enabledFeatures.join(', ')}` : '';
-                setStatus(`连接成功，aria2 ${result.version}${features}`, 'success');
+                const normalized = {
+                    ...formSettings(),
+                    url: normalizeQbUrl(urlInput.value),
+                    apiKey: apiKeyInput.value.trim(),
+                };
+                const result = await testQbConnection(normalized);
+                setStatus(`连接成功，qBittorrent ${result.version}`, 'success');
             } catch (error) {
                 setStatus(error?.message || String(error), 'error');
             } finally {
@@ -624,29 +752,29 @@
             }
         });
 
-        panel.append(title, description, urlLabel, secretLabel, actions, status);
+        panel.append(title, description, enabledLabel, urlLabel, apiKeyLabel, timeoutLabel, actions, status);
         overlay.appendChild(panel);
         document.body.appendChild(overlay);
         urlInput.focus();
         return overlay;
     }
 
-    async function showAria2ConnectionResult() {
+    async function showQbConnectionResult() {
         try {
-            const result = await testAria2Connection();
-            globalThis.alert?.(`aria2 连接成功\n版本：${result.version}`);
+            const result = await testQbConnection();
+            globalThis.alert?.(`qBittorrent 连接成功\n版本：${result.version}`);
         } catch (error) {
-            globalThis.alert?.(`aria2 连接失败\n${error?.message || error}`);
+            globalThis.alert?.(`qBittorrent 连接失败\n${error?.message || error}`);
         }
     }
 
-    function registerAria2MenuCommands() {
+    function registerQbMenuCommands() {
         if (typeof GM_registerMenuCommand !== 'function') return;
-        GM_registerMenuCommand('⚙️ aria2 设置', openAria2Settings);
-        GM_registerMenuCommand('🔌 测试 aria2 连接', showAria2ConnectionResult);
+        GM_registerMenuCommand('⚙️ qBittorrent 设置', openQbSettings);
+        GM_registerMenuCommand('🔌 测试 qBittorrent 连接', showQbConnectionResult);
     }
 
-    function createTorrentButton(hash) {
+    function createTorrentButton(hash, magnet = '') {
         const button = document.createElement('a');
         button.href = torrentUrl(hash);
         button.textContent = CONFIG.buttonText;
@@ -654,6 +782,8 @@
         button.rel = 'noopener noreferrer';
         button.referrerPolicy = 'no-referrer';
         button.className = 'mtt-button';
+        button.dataset.hash = hash;
+        if (magnet) button.dataset.magnet = magnet;
         button.setAttribute(OWNED_ATTR, '');
         button.setAttribute('aria-label', `下载种子 ${hash}`);
         button.addEventListener('click', async event => {
@@ -662,9 +792,11 @@
             button.dataset.downloading = 'true';
             button.setAttribute('aria-disabled', 'true');
             const originalText = button.textContent;
-            button.textContent = '⏳ 读取名称';
+            button.textContent = '⏳ 查询缓存';
             try {
-                const filename = await downloadTorrent(hash);
+                const filename = await downloadTorrent(hash, magnet, stage => {
+                    button.textContent = stage === 'qbittorrent' ? '🔎 qB 查元数据' : '⏳ 查询缓存';
+                });
                 button.textContent = '✅ 已下载';
                 button.title = filename;
             } catch (error) {
@@ -699,8 +831,8 @@
 
             link.setAttribute(PROCESSED_ATTR, '');
             const next = link.nextElementSibling;
-            if (next?.hasAttribute(OWNED_ATTR) && next.href === torrentUrl(hash)) continue;
-            link.after(createTorrentButton(hash));
+            if (next?.hasAttribute(OWNED_ATTR) && next.dataset.hash === hash) continue;
+            link.after(createTorrentButton(hash, href));
         }
     }
 
@@ -716,8 +848,11 @@
             const buttons = document.createElement('span');
             buttons.className = 'mtt-code-buttons';
             buttons.setAttribute(OWNED_ATTR, '');
-            const uniqueHashes = new Set(magnets.map(({ hash }) => hash));
-            for (const hash of uniqueHashes) buttons.appendChild(createTorrentButton(hash));
+            const uniqueMagnets = new Map();
+            for (const { hash, magnet } of magnets) {
+                if (!uniqueMagnets.has(hash)) uniqueMagnets.set(hash, magnet);
+            }
+            for (const [hash, magnet] of uniqueMagnets) buttons.appendChild(createTorrentButton(hash, magnet));
             block.after(buttons);
         }
     }
@@ -762,7 +897,7 @@
                 magnetLink.textContent = magnet;
                 magnetLink.className = 'mtt-magnet';
                 magnetLink.rel = 'noreferrer';
-                wrapper.append(magnetLink, createTorrentButton(hash));
+                wrapper.append(magnetLink, createTorrentButton(hash, magnet));
                 fragment.append(wrapper);
                 cursor = index + magnet.length;
             }
@@ -820,23 +955,24 @@
             downloadTorrent,
             extractHash,
             findMagnets,
-            getAria2Settings,
+            getQbSettings,
             normalizeHash,
-            normalizeAria2Url,
-            openAria2Settings,
+            normalizeQbUrl,
+            openQbSettings,
             parseTorrentName,
-            requestAria2,
+            requestQb,
             requestTorrent,
-            saveAria2Settings,
+            requestTorrentViaQbittorrent,
+            saveQbSettings,
             scan,
             stop: () => observer.disconnect(),
-            testAria2Connection,
+            testQbConnection,
             torrentFilename,
             torrentUrl,
             verifyTorrentHash,
         };
     }
 
-    registerAria2MenuCommands();
+    registerQbMenuCommands();
     start();
 })();
