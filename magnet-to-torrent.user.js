@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      4.0.0
+// @version      4.0.1
 // @description  识别页面中的磁力链接，通过公共缓存或 qBittorrent 元数据解析下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
@@ -35,12 +35,14 @@
         debounceMs: 180,
         qbittorrent: Object.freeze({
             defaultUrl: 'http://127.0.0.1:8080',
+            defaultUsername: 'admin',
             requestTimeoutMs: 10000,
             metadataTimeoutMs: 60000,
             pollIntervalMs: 2000,
             enabledStorageKey: 'mtt-qb-enabled',
             urlStorageKey: 'mtt-qb-url',
-            apiKeyStorageKey: 'mtt-qb-api-key',
+            usernameStorageKey: 'mtt-qb-username',
+            passwordStorageKey: 'mtt-qb-password',
             metadataTimeoutStorageKey: 'mtt-qb-metadata-timeout-ms',
         }),
     });
@@ -54,6 +56,9 @@
     const BTIH_REGEX = /urn:btih:([a-f\d]{40}|[a-z2-7]{32})/i;
     const MAGNET_REGEX = /magnet:\?[^\s<>"'`]+/gi;
     const BASE32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+    let qbSessionFingerprint = '';
+    let qbLoginPromise = null;
 
     function decodeSafely(value) {
         try {
@@ -139,7 +144,9 @@
             enabled: getStoredValue(CONFIG.qbittorrent.enabledStorageKey, false) === true,
             url: String(getStoredValue(CONFIG.qbittorrent.urlStorageKey, CONFIG.qbittorrent.defaultUrl)
                 || CONFIG.qbittorrent.defaultUrl),
-            apiKey: String(getStoredValue(CONFIG.qbittorrent.apiKeyStorageKey, '') || ''),
+            username: String(getStoredValue(CONFIG.qbittorrent.usernameStorageKey, CONFIG.qbittorrent.defaultUsername)
+                || CONFIG.qbittorrent.defaultUsername),
+            password: String(getStoredValue(CONFIG.qbittorrent.passwordStorageKey, '') || ''),
             metadataTimeoutMs: Number.isFinite(rawTimeout)
                 ? Math.min(300000, Math.max(10000, Math.round(rawTimeout)))
                 : CONFIG.qbittorrent.metadataTimeoutMs,
@@ -151,16 +158,22 @@
         if (!Number.isFinite(timeout) || timeout < 10000 || timeout > 300000) {
             throw new Error('元数据等待时间需在 10～300 秒之间');
         }
+        const username = String(settings?.username || '').trim();
+        if (!username) throw new Error('请输入 qBittorrent WebUI 用户名');
+
         const normalized = {
             enabled: Boolean(settings?.enabled),
             url: normalizeQbUrl(settings?.url),
-            apiKey: String(settings?.apiKey || '').trim(),
+            username,
+            password: String(settings?.password || ''),
             metadataTimeoutMs: Math.round(timeout),
         };
         setStoredValue(CONFIG.qbittorrent.enabledStorageKey, normalized.enabled);
         setStoredValue(CONFIG.qbittorrent.urlStorageKey, normalized.url);
-        setStoredValue(CONFIG.qbittorrent.apiKeyStorageKey, normalized.apiKey);
+        setStoredValue(CONFIG.qbittorrent.usernameStorageKey, normalized.username);
+        setStoredValue(CONFIG.qbittorrent.passwordStorageKey, normalized.password);
         setStoredValue(CONFIG.qbittorrent.metadataTimeoutStorageKey, normalized.metadataTimeoutMs);
+        qbSessionFingerprint = '';
         return normalized;
     }
 
@@ -169,10 +182,23 @@
         return `${base}${path.startsWith('/') ? path : `/${path}`}`;
     }
 
+    function qbRequestHeaders(settings, headers = {}) {
+        const base = normalizeQbUrl(settings.url);
+        const url = new URL(base);
+        return {
+            Origin: url.origin,
+            Referer: `${base}/`,
+            ...headers,
+        };
+    }
+
     function qbErrorMessage(response, path) {
         const body = String(response?.responseText || '').trim();
+        if (path === '/api/v2/auth/login' && (response?.status === 401 || response?.status === 403)) {
+            return 'qBittorrent 登录失败；请检查 WebUI 用户名和密码';
+        }
         if (response?.status === 401 || response?.status === 403) {
-            return 'qBittorrent 拒绝访问；请配置 WebUI API Key，或确认该地址允许当前客户端免认证';
+            return 'qBittorrent 会话无效或访问被拒绝';
         }
         if (response?.status === 404 && path.includes('/torrents/')) {
             return 'qBittorrent 未提供元数据 API；请使用支持 WebAPI 2.11.9+ 的版本';
@@ -180,12 +206,14 @@
         return `qBittorrent 请求失败（HTTP ${response?.status ?? '未知'}）${body ? `：${body}` : ''}`;
     }
 
-    function requestQb(path, {
+    function requestQbRaw(path, {
         method = 'GET',
         responseType = 'text',
         timeout = CONFIG.qbittorrent.requestTimeoutMs,
         allowedStatuses = [200],
         settings = getQbSettings(),
+        headers = {},
+        data,
     } = {}) {
         return new Promise((resolve, reject) => {
             if (typeof GM_xmlhttpRequest !== 'function') {
@@ -201,16 +229,14 @@
                 return;
             }
 
-            const headers = {};
-            if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
-
             GM_xmlhttpRequest({
                 method,
                 url,
-                headers,
+                headers: qbRequestHeaders(settings, headers),
+                data,
                 responseType,
                 timeout,
-                anonymous: true,
+                anonymous: false,
                 onload(response) {
                     if (!allowedStatuses.includes(response.status)) {
                         const error = new Error(qbErrorMessage(response, path));
@@ -226,7 +252,63 @@
         });
     }
 
+    function qbSettingsFingerprint(settings) {
+        return `${normalizeQbUrl(settings.url)}\n${settings.username}\n${settings.password}`;
+    }
+
+    async function loginQb(settings = getQbSettings(), force = false) {
+        const normalized = {
+            ...settings,
+            url: normalizeQbUrl(settings.url),
+            username: String(settings.username || '').trim(),
+            password: String(settings.password || ''),
+        };
+        if (!normalized.username) throw new Error('请输入 qBittorrent WebUI 用户名');
+
+        const fingerprint = qbSettingsFingerprint(normalized);
+        if (!force && qbSessionFingerprint === fingerprint) return true;
+        if (!force && qbLoginPromise) return qbLoginPromise;
+
+        const task = (async () => {
+            const response = await requestQbRaw('/api/v2/auth/login', {
+                method: 'POST',
+                responseType: 'text',
+                settings: normalized,
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                data: new URLSearchParams({
+                    username: normalized.username,
+                    password: normalized.password,
+                }).toString(),
+            });
+            const text = String(response.responseText || response.response || '').trim().toLowerCase();
+            if (text === 'fails.') throw new Error('qBittorrent 登录失败；请检查 WebUI 用户名和密码');
+            qbSessionFingerprint = fingerprint;
+            return true;
+        })();
+
+        qbLoginPromise = task;
+        try {
+            return await task;
+        } finally {
+            if (qbLoginPromise === task) qbLoginPromise = null;
+        }
+    }
+
+    async function requestQb(path, options = {}) {
+        const settings = options.settings || getQbSettings();
+        await loginQb(settings);
+        try {
+            return await requestQbRaw(path, { ...options, settings });
+        } catch (error) {
+            if (error?.status !== 401 && error?.status !== 403) throw error;
+            qbSessionFingerprint = '';
+            await loginQb(settings, true);
+            return requestQbRaw(path, { ...options, settings });
+        }
+    }
+
     async function testQbConnection(settings = getQbSettings()) {
+        await loginQb(settings, true);
         const response = await requestQb('/api/v2/app/version', { settings, responseType: 'text' });
         const version = String(response.responseText || response.response || '').trim();
         if (!version) throw new Error('qBittorrent 已响应，但未返回版本号');
@@ -608,7 +690,7 @@
             .mtt-qb-panel h2 { margin:0 0 8px; font-size:20px; }
             .mtt-qb-panel p { margin:0 0 14px; color:#555; }
             .mtt-qb-field { display:block; margin:12px 0; font-weight:600; }
-            .mtt-qb-field input[type="url"], .mtt-qb-field input[type="password"], .mtt-qb-field input[type="number"] {
+            .mtt-qb-field input[type="url"], .mtt-qb-field input[type="text"], .mtt-qb-field input[type="password"], .mtt-qb-field input[type="number"] {
                 display:block; width:100%; box-sizing:border-box; margin-top:5px; padding:8px 10px;
                 border:1px solid #bbb; border-radius:5px; background:#fff; color:#222; font:14px/1.4 monospace; }
             .mtt-qb-check { display:flex; gap:8px; align-items:center; margin:12px 0; font-weight:600; }
@@ -643,7 +725,7 @@
         title.id = 'mtt-qb-title';
         title.textContent = 'qBittorrent 元数据回退设置';
         const description = document.createElement('p');
-        description.textContent = '公共缓存均失败后，脚本可调用 qBittorrent WebAPI 从 DHT/Peer 获取元数据。推荐配置 WebUI API Key；此流程不会把任务添加到下载列表。';
+        description.textContent = '公共缓存均失败后，脚本会使用 WebUI 用户名和密码登录 qBittorrent，再从 DHT/Peer 获取元数据；不会把磁力加入下载列表。';
 
         const enabledLabel = document.createElement('label');
         enabledLabel.className = 'mtt-qb-check';
@@ -665,16 +747,28 @@
         urlInput.autocomplete = 'url';
         urlLabel.appendChild(urlInput);
 
-        const apiKeyLabel = document.createElement('label');
-        apiKeyLabel.className = 'mtt-qb-field';
-        apiKeyLabel.textContent = 'WebUI API Key（推荐）';
-        const apiKeyInput = document.createElement('input');
-        apiKeyInput.name = 'qb-api-key';
-        apiKeyInput.type = 'password';
-        apiKeyInput.value = current.apiKey;
-        apiKeyInput.placeholder = 'Bearer API Key；本机免认证时可留空';
-        apiKeyInput.autocomplete = 'off';
-        apiKeyLabel.appendChild(apiKeyInput);
+        const usernameLabel = document.createElement('label');
+        usernameLabel.className = 'mtt-qb-field';
+        usernameLabel.textContent = '用户名';
+        const usernameInput = document.createElement('input');
+        usernameInput.name = 'qb-username';
+        usernameInput.type = 'text';
+        usernameInput.required = true;
+        usernameInput.value = current.username;
+        usernameInput.placeholder = CONFIG.qbittorrent.defaultUsername;
+        usernameInput.autocomplete = 'username';
+        usernameLabel.appendChild(usernameInput);
+
+        const passwordLabel = document.createElement('label');
+        passwordLabel.className = 'mtt-qb-field';
+        passwordLabel.textContent = '密码';
+        const passwordInput = document.createElement('input');
+        passwordInput.name = 'qb-password';
+        passwordInput.type = 'password';
+        passwordInput.value = current.password;
+        passwordInput.placeholder = 'qBittorrent WebUI 密码';
+        passwordInput.autocomplete = 'current-password';
+        passwordLabel.appendChild(passwordInput);
 
         const timeoutLabel = document.createElement('label');
         timeoutLabel.className = 'mtt-qb-field';
@@ -699,7 +793,8 @@
         const formSettings = () => ({
             enabled: enabledInput.checked,
             url: urlInput.value,
-            apiKey: apiKeyInput.value,
+            username: usernameInput.value,
+            password: passwordInput.value,
             metadataTimeoutMs: Number(timeoutInput.value) * 1000,
         });
 
@@ -710,7 +805,7 @@
         saveButton.textContent = '保存';
         const testButton = document.createElement('button');
         testButton.type = 'button';
-        testButton.textContent = '测试连接';
+        testButton.textContent = '测试登录';
         const closeButton = document.createElement('button');
         closeButton.type = 'button';
         closeButton.textContent = '关闭';
@@ -727,7 +822,8 @@
                 const saved = saveQbSettings(formSettings());
                 enabledInput.checked = saved.enabled;
                 urlInput.value = saved.url;
-                apiKeyInput.value = saved.apiKey;
+                usernameInput.value = saved.username;
+                passwordInput.value = saved.password;
                 timeoutInput.value = String(Math.round(saved.metadataTimeoutMs / 1000));
                 setStatus('设置已保存。', 'success');
             } catch (error) {
@@ -736,15 +832,16 @@
         });
         testButton.addEventListener('click', async () => {
             testButton.disabled = true;
-            setStatus('正在连接 qBittorrent…');
+            setStatus('正在登录 qBittorrent…');
             try {
                 const normalized = {
                     ...formSettings(),
                     url: normalizeQbUrl(urlInput.value),
-                    apiKey: apiKeyInput.value.trim(),
+                    username: usernameInput.value.trim(),
+                    password: passwordInput.value,
                 };
                 const result = await testQbConnection(normalized);
-                setStatus(`连接成功，qBittorrent ${result.version}`, 'success');
+                setStatus(`登录成功，qBittorrent ${result.version}`, 'success');
             } catch (error) {
                 setStatus(error?.message || String(error), 'error');
             } finally {
@@ -752,7 +849,7 @@
             }
         });
 
-        panel.append(title, description, enabledLabel, urlLabel, apiKeyLabel, timeoutLabel, actions, status);
+        panel.append(title, description, enabledLabel, urlLabel, usernameLabel, passwordLabel, timeoutLabel, actions, status);
         overlay.appendChild(panel);
         document.body.appendChild(overlay);
         urlInput.focus();
@@ -762,16 +859,16 @@
     async function showQbConnectionResult() {
         try {
             const result = await testQbConnection();
-            globalThis.alert?.(`qBittorrent 连接成功\n版本：${result.version}`);
+            globalThis.alert?.(`qBittorrent 登录成功\n版本：${result.version}`);
         } catch (error) {
-            globalThis.alert?.(`qBittorrent 连接失败\n${error?.message || error}`);
+            globalThis.alert?.(`qBittorrent 登录失败\n${error?.message || error}`);
         }
     }
 
     function registerQbMenuCommands() {
         if (typeof GM_registerMenuCommand !== 'function') return;
         GM_registerMenuCommand('⚙️ qBittorrent 设置', openQbSettings);
-        GM_registerMenuCommand('🔌 测试 qBittorrent 连接', showQbConnectionResult);
+        GM_registerMenuCommand('🔌 测试 qBittorrent 登录', showQbConnectionResult);
     }
 
     function createTorrentButton(hash, magnet = '') {
@@ -956,6 +1053,7 @@
             extractHash,
             findMagnets,
             getQbSettings,
+            loginQb,
             normalizeHash,
             normalizeQbUrl,
             openQbSettings,
