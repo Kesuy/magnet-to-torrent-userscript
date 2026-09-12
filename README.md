@@ -10,6 +10,12 @@
 
 已安装旧版本时，userscript 管理器会根据脚本中的 `@updateURL` 自动检查更新。
 
+## 4.0.2：qBittorrent 5.2 / Torrage 兼容修复
+
+- qBittorrent WebUI 登录同时接受 HTTP `200` 和 `204`，兼容新版 qBittorrent 5.2.x 的登录响应。
+- 修正 Torrage 下载接口为 `https://torrage.info/torrent.php?h=INFO_HASH`。
+- 其余下载流程保持不变：公共缓存失败后再回退到 qBittorrent 元数据解析。
+
 ## 4.0.1：qBittorrent 用户名 / 密码登录
 
 - qBittorrent 回退改为使用 WebUI **用户名 + 密码** 登录，不再使用 API Key。
