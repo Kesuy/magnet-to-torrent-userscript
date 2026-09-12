@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      4.0.3
+// @version      4.0.4
 // @description  识别页面中的磁力链接，通过公共缓存或 qBittorrent 元数据解析下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
@@ -619,7 +619,7 @@
             : `magnet:?xt=urn:btih:${hash}`;
         const query = `source=${encodeURIComponent(source)}`;
         const deadline = Date.now() + settings.metadataTimeoutMs;
-        const fetchPath = `/api/v2/torrents/fetchMetadata?${query}`;
+        const fetchPath = '/api/v2/torrents/fetchMetadata';
         const savePath = `/api/v2/torrents/saveMetadata?${query}`;
 
         const existing = await tryExportQbTorrent(
@@ -632,10 +632,13 @@
         while (Date.now() < deadline) {
             const remaining = Math.max(1000, deadline - Date.now());
             const response = await requestQb(fetchPath, {
+                method: 'POST',
                 settings,
                 responseType: 'text',
                 timeout: Math.min(CONFIG.qbittorrent.requestTimeoutMs, remaining),
                 allowedStatuses: [200, 202],
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                data: new URLSearchParams({ source }).toString(),
             });
             if (response.status === 200) {
                 const exported = await tryExportQbTorrent(
