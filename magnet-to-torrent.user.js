@@ -791,7 +791,8 @@
 
         const passwordLabel = document.createElement('label');
         passwordLabel.className = 'mtt-qb-field';
-        passwordInput = document.createElement('input');
+        passwordLabel.textContent = '密码';
+        const passwordInput = document.createElement('input');
         passwordInput.name = 'qb-password';
         passwordInput.type = 'password';
         passwordInput.value = current.password;
