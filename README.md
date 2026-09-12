@@ -10,6 +10,13 @@
 
 已安装旧版本时，userscript 管理器会根据脚本中的 `@updateURL` 自动检查更新。
 
+## 4.0.4：修复 qBittorrent metadata 请求方法
+
+- 修复 `torrents/fetchMetadata` 请求方式：按 qBittorrent 5.2 WebUI 的实现改为 `POST`。
+- `source` 改为通过 `application/x-www-form-urlencoded` 请求体发送，不再把 `fetchMetadata` 当作 GET 接口调用。
+- 保留 4.0.3 的优先 `torrents/export` 逻辑；目标任务不存在时才进入 `fetchMetadata` + `saveMetadata` 流程。
+- `torrents/saveMetadata` 仍保持 GET 下载方式。
+
 ## 4.0.3：兼容 qBittorrent 中已存在的任务
 
 - qBittorrent 回退时先调用 `torrents/export`，如果目标 hash 已经存在于下载列表且 metadata 完整，直接导出 `.torrent`。
@@ -68,7 +75,7 @@
 3. 如果缓存均失败且未启用 qBittorrent，则直接提示失败。
 4. 如果已启用 qBittorrent，则先登录 WebUI。
 5. 先调用 `torrents/export`；如果相同 hash 已存在于 qBittorrent 且 metadata 完整，直接导出 torrent。
-6. 如果当前任务无法直接导出，则调用 `torrents/fetchMetadata`，由 qBittorrent 使用 DHT / Tracker / Peer 查找 metadata。
+6. 如果当前任务无法直接导出，则通过 `POST torrents/fetchMetadata` 提交完整 magnet URI，由 qBittorrent 使用 DHT / Tracker / Peer 查找 metadata。
 7. metadata 可用后再次尝试 `torrents/export`；如果不是现有任务，则通过 `torrents/saveMetadata` 导出 torrent。
 8. 再次校验 infohash，最后按 torrent 内的实际名称保存文件。
 
