@@ -10,6 +10,13 @@
 
 已安装旧版本时，userscript 管理器会根据脚本中的 `@updateURL` 自动检查更新。
 
+## 4.0.3：兼容 qBittorrent 中已存在的任务
+
+- qBittorrent 回退时先调用 `torrents/export`，如果目标 hash 已经存在于下载列表且 metadata 完整，直接导出 `.torrent`。
+- `fetchMetadata` 返回 metadata 已就绪后，也会再次尝试 `torrents/export`，避免已有任务的 metadata 不在临时 metadata cache 中时 `saveMetadata` 一直返回 `409`。
+- qBittorrent 中不存在该任务时，仍按原流程使用 `fetchMetadata` + `saveMetadata` 从 DHT / Tracker / Peer 获取并导出元数据。
+- 所有通过 `torrents/export` 得到的 torrent 仍会校验实际 infohash，避免导出错误文件。
+
 ## 4.0.2：qBittorrent 5.2 / Torrage 兼容修复
 
 - qBittorrent WebUI 登录同时接受 HTTP `200` 和 `204`，兼容新版 qBittorrent 5.2.x 的登录响应。
@@ -60,9 +67,10 @@
 2. 每个返回文件都会先解析 bencode，并校验 BTIH。
 3. 如果缓存均失败且未启用 qBittorrent，则直接提示失败。
 4. 如果已启用 qBittorrent，则先登录 WebUI。
-5. 调用 `torrents/fetchMetadata`，由 qBittorrent 使用 DHT / Tracker / Peer 查找 metadata。
-6. metadata 可用后调用 `torrents/saveMetadata` 导出 torrent。
-7. 再次校验 infohash，最后按 torrent 内的实际名称保存文件。
+5. 先调用 `torrents/export`；如果相同 hash 已存在于 qBittorrent 且 metadata 完整，直接导出 torrent。
+6. 如果当前任务无法直接导出，则调用 `torrents/fetchMetadata`，由 qBittorrent 使用 DHT / Tracker / Peer 查找 metadata。
+7. metadata 可用后再次尝试 `torrents/export`；如果不是现有任务，则通过 `torrents/saveMetadata` 导出 torrent。
+8. 再次校验 infohash，最后按 torrent 内的实际名称保存文件。
 
 如果缓存不存在，而且 DHT / Tracker / Peer 中也没有任何节点能够提供 metadata，那么 qBittorrent 同样无法恢复完整 torrent。这属于磁力本身已经“死种/无元数据来源”，不是脚本故障。
 
