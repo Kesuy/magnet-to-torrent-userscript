@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      4.0.1
+// @version      4.0.2
 // @description  识别页面中的磁力链接，通过公共缓存或 qBittorrent 元数据解析下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
@@ -26,7 +26,7 @@
     const CONFIG = Object.freeze({
         torrentSources: Object.freeze([
             hash => `https://itorrents.net/torrent/${hash}.torrent`,
-            hash => `https://torrage.info/torrent/${hash}.torrent`,
+            hash => `https://torrage.info/torrent.php?h=${hash}`,
             hash => `https://itorrents.org/torrent/${hash}.torrent`,
             hash => `https://btcache.me/torrent/${hash}`,
         ]),
@@ -274,6 +274,7 @@
                 method: 'POST',
                 responseType: 'text',
                 settings: normalized,
+                allowedStatuses: [200, 204],
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
                 data: new URLSearchParams({
                     username: normalized.username,
