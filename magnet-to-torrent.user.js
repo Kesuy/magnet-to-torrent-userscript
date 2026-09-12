@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      4.0.2
+// @version      4.0.3
 // @description  识别页面中的磁力链接，通过公共缓存或 qBittorrent 元数据解析下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
@@ -596,6 +596,21 @@
         throw error;
     }
 
+    async function tryExportQbTorrent(hash, settings, timeout = CONFIG.qbittorrent.requestTimeoutMs) {
+        const response = await requestQb(`/api/v2/torrents/export?hash=${encodeURIComponent(hash)}`, {
+            settings,
+            responseType: 'arraybuffer',
+            timeout,
+            allowedStatuses: [200, 404, 409],
+        });
+        if (response.status !== 200 || !response.response) return null;
+
+        const bytes = new Uint8Array(response.response);
+        parseTorrentName(bytes);
+        await verifyTorrentHash(bytes, hash);
+        return bytes;
+    }
+
     async function requestTorrentViaQbittorrent(hash, magnet = '', settings = getQbSettings()) {
         if (!settings.enabled) throw new Error('qBittorrent 回退未启用');
 
@@ -607,6 +622,13 @@
         const fetchPath = `/api/v2/torrents/fetchMetadata?${query}`;
         const savePath = `/api/v2/torrents/saveMetadata?${query}`;
 
+        const existing = await tryExportQbTorrent(
+            hash,
+            settings,
+            Math.min(CONFIG.qbittorrent.requestTimeoutMs, settings.metadataTimeoutMs),
+        );
+        if (existing) return existing;
+
         while (Date.now() < deadline) {
             const remaining = Math.max(1000, deadline - Date.now());
             const response = await requestQb(fetchPath, {
@@ -616,6 +638,13 @@
                 allowedStatuses: [200, 202],
             });
             if (response.status === 200) {
+                const exported = await tryExportQbTorrent(
+                    hash,
+                    settings,
+                    Math.min(CONFIG.qbittorrent.requestTimeoutMs, remaining),
+                );
+                if (exported) return exported;
+
                 const saved = await requestQb(savePath, {
                     settings,
                     responseType: 'arraybuffer',
@@ -633,7 +662,7 @@
             if (delay > 0) await sleep(delay);
         }
 
-        throw new Error(`qBittorrent 在 ${Math.round(settings.metadataTimeoutMs / 1000)} 秒内未获取到元数据（可能没有可用的 DHT/Peer）`);
+        throw new Error(`qBittorrent 在 ${Math.round(settings.metadataTimeoutMs / 1000)} 秒内未获取到可导出的元数据（可能没有可用的 DHT/Peer）`);
     }
 
     async function requestTorrent(hash, magnet = '', onStage = () => {}) {
@@ -762,8 +791,7 @@
 
         const passwordLabel = document.createElement('label');
         passwordLabel.className = 'mtt-qb-field';
-        passwordLabel.textContent = '密码';
-        const passwordInput = document.createElement('input');
+        passwordInput = document.createElement('input');
         passwordInput.name = 'qb-password';
         passwordInput.type = 'password';
         passwordInput.value = current.password;
@@ -1068,6 +1096,7 @@
             testQbConnection,
             torrentFilename,
             torrentUrl,
+            tryExportQbTorrent,
             verifyTorrentHash,
         };
     }
