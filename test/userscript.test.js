@@ -168,10 +168,12 @@ test('BTSOW 磁力输入值变更后替换按钮，不留下旧的 hash', async 
 });
 
 test('BTSOW 适配只作用于设置的域名，新增域名后立即生效', () => {
+    const btsowDomainStore = new Map();
     const magnet = 'magnet:?xt=urn:btih:' + HEX_HASH;
     const { dom, api, document } = boot(
         '<textarea class="magnet-link">' + magnet + '</textarea>',
-        { GM_getValue(key, fallback) { return fallback; }, GM_setValue(key, value) { this._store = [key, value]; } },
+        { GM_getValue(key, fallback) { return btsowDomainStore.has(key) ? btsowDomainStore.get(key) : fallback; },
+          GM_setValue(key, value) { btsowDomainStore.set(key, value); } },
         'https://btsow.new/magnet/detail/' + HEX_HASH,
     );
     assert.equal(buttons(document).length, 0);
