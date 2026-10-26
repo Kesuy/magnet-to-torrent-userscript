@@ -10,6 +10,21 @@
 
 已安装旧版本时，userscript 管理器会根据脚本中的 `@updateURL` 自动检查更新。
 
+## 4.0.5：BTSOW 磁力详情页支持与自定义域名
+
+- 在 BTSOW 磁力详情页（例如 `https://btsow.live/magnet/detail/<BTIH>`）的磁力文本框下方添加 **📥 种子** 按钮。
+- 支持从 BTSOW 的 `textarea.magnet-link`（以及同类输入框）读取完整 magnet URI，包括名称、Tracker 参数；继续沿用已有缓存 / qBittorrent 下载流程及 infohash 校验。
+- 详情页已有的“Open with BT Client”磁力按钮不再重复注入同一个 .torrent 下载按钮。
+- 因 BTSOW 域名可能变更，脚本菜单新增 **🌐 BTSOW 域名设置**，默认 `btsow.live`，支持填写多个域名（逐行或逗号分隔）、去重和保存。
+- 新域名无需修改 userscript 的 `@match`，在域名设置里保存即可；已打开的新域名详情页会立即重新扫描，其他站点不受影响。
+
+### BTSOW 域名设置操作
+
+1. 在 Tampermonkey / Violentmonkey 的脚本菜单点击 **🌐 BTSOW 域名设置**。
+2. 输入当前 BTSOW 域名，例如 `btsow.live`；也可使用 `https://btsow.live/`。不同域名可分行填写。
+3. 点击“保存”即可。域名设置不支持填写 `/magnet/detail/...` 路径、端口和查询参数。请只添加可信的 BTSOW 站点域名。
+
+> BTSOW 磁力框的适配仅在已配置域名的 `/magnet/detail/...` 页面启用。脚本原有的通用磁力链接识别、缓存源和 qBittorrent 回退逻辑保持不变。
 ## 4.0.4：修复 qBittorrent metadata 请求方法
 
 - 修复 `torrents/fetchMetadata` 请求方式：按 qBittorrent 5.2 WebUI 的实现改为 `POST`。
@@ -90,6 +105,7 @@
 - 32 位 Base32 BTIH
 - SPA / 无限滚动等动态加载页面
 - 完整 magnet URI，包括名称和 tracker 参数
+- BTSOW 磁力详情页的 `textarea.magnet-link` 输入框（仅限配置的 BTSOW 域名）
 
 ## 文件安全校验
 
@@ -104,7 +120,7 @@
 
 ## 隐私与权限
 
-脚本使用 `@match *://*/*`，因为需要在任意网页识别磁力链接。
+脚本使用 `@match *://*/*`，因为需要在任意网页识别磁力链接。BTSOW 的特殊文本框适配仅在用户设置的 BTSOW 域名下生效，无需每次换域名都修改脚本匹配规则。
 
 `@connect *` 用于支持用户自行填写不同地址的 qBittorrent WebUI。脚本不会把当前网页正文上传给 qBittorrent；qB 回退只发送对应的 magnet URI，并使用你配置的 WebUI 登录信息建立会话。
 
