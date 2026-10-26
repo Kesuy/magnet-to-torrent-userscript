@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         磁力链接转种子下载
 // @namespace    https://github.com/Kesuy/magnet-to-torrent-userscript
-// @version      4.0.4
+// @version      4.0.5
 // @description  识别页面中的磁力链接，通过公共缓存或 qBittorrent 元数据解析下载 .torrent 文件
 // @author       Kesuy
 // @match        *://*/*
@@ -33,6 +33,10 @@
         cacheRequestTimeoutMs: 8000,
         buttonText: '📥 种子',
         debounceMs: 180,
+        btsow: Object.freeze({
+            defaultDomains: 'btsow.live',
+            domainsStorageKey: 'mtt-btsow-domains',
+        }),
         qbittorrent: Object.freeze({
             defaultUrl: 'http://127.0.0.1:8080',
             defaultUsername: 'admin',
@@ -51,6 +55,7 @@
     const PROCESSED_ATTR = 'data-mtt-processed';
     const STYLE_ID = 'mtt-styles';
     const QB_DIALOG_ID = 'mtt-qb-dialog';
+    const BTSOW_DIALOG_ID = 'mtt-btsow-dialog';
     const CODE_SELECTOR = 'pre, code, div.blockcode';
     const SKIP_SELECTOR = `a, button, script, style, textarea, input, select, option, [contenteditable], [${OWNED_ATTR}]`;
     const BTIH_REGEX = /urn:btih:([a-f\d]{40}|[a-z2-7]{32})/i;
@@ -110,6 +115,54 @@
             throw new Error('当前 userscript 管理器不支持保存设置');
         }
         GM_setValue(key, value);
+    }
+
+
+    function normalizeBtsowDomain(value) {
+        const input = String(value || '').trim();
+        if (!input) throw new Error('BTSOW 域名不能为空');
+        let url;
+        try {
+            url = new URL(/^https?:\/\//i.test(input) ? input : 'https://' + input);
+        } catch {
+            throw new Error('无效的 BTSOW 域名：' + input);
+        }
+        if (!['http:', 'https:'].includes(url.protocol) ||
+            url.username || url.password || url.port || url.search || url.hash || url.pathname !== '/') {
+            throw new Error('BTSOW 设置只接受域名，不能包含端口、路径或参数：' + input);
+        }
+        const hostname = url.hostname.toLowerCase().replace(/\.$/, '');
+        if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i.test(hostname)) {
+            throw new Error('无效的 BTSOW 域名：' + input);
+        }
+        return hostname;
+    }
+
+    function parseBtsowDomains(value) {
+        const entries = String(value || '').split(/[\s,，;；]+/).filter(Boolean);
+        if (!entries.length) throw new Error('请至少填写一个 BTSOW 域名');
+        return [...new Set(entries.map(normalizeBtsowDomain))];
+    }
+
+    function getBtsowDomains() {
+        const raw = getStoredValue(CONFIG.btsow.domainsStorageKey, CONFIG.btsow.defaultDomains);
+        try {
+            return parseBtsowDomains(raw);
+        } catch {
+            return parseBtsowDomains(CONFIG.btsow.defaultDomains);
+        }
+    }
+
+    function saveBtsowDomains(value) {
+        const domains = parseBtsowDomains(value);
+        setStoredValue(CONFIG.btsow.domainsStorageKey, domains.join('\n'));
+        return domains;
+    }
+
+    function isBtsowDetailPage() {
+        if (!/^\/magnet\/detail\/[^/]+\/?$/.test(window.location.pathname)) return false;
+        const hostname = window.location.hostname.toLowerCase().replace(/\.$/, '');
+        return getBtsowDomains().some(domain => hostname === domain || hostname === 'www.' + domain);
     }
 
     function normalizeQbUrl(value) {
@@ -723,9 +776,12 @@
             .mtt-qb-panel h2 { margin:0 0 8px; font-size:20px; }
             .mtt-qb-panel p { margin:0 0 14px; color:#555; }
             .mtt-qb-field { display:block; margin:12px 0; font-weight:600; }
-            .mtt-qb-field input[type="url"], .mtt-qb-field input[type="text"], .mtt-qb-field input[type="password"], .mtt-qb-field input[type="number"] {
+            .mtt-qb-field input[type="url"], .mtt-qb-field input[type="text"], .mtt-qb-field input[type="password"], .mtt-qb-field input[type="number"], .mtt-qb-field textarea {
                 display:block; width:100%; box-sizing:border-box; margin-top:5px; padding:8px 10px;
                 border:1px solid #bbb; border-radius:5px; background:#fff; color:#222; font:14px/1.4 monospace; }
+            .mtt-qb-field textarea { min-height:100px; resize:vertical; }
+            .mtt-btsow-buttons { display:flex; justify-content:center; margin:10px 0 0; }
+            .mtt-btsow-buttons .mtt-button { margin-left:0; }
             .mtt-qb-check { display:flex; gap:8px; align-items:center; margin:12px 0; font-weight:600; }
             .mtt-qb-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
             .mtt-qb-actions button { padding:7px 14px; border:1px solid #aaa; border-radius:5px; cursor:pointer; }
@@ -898,10 +954,80 @@
         }
     }
 
+
+    function openBtsowSettings() {
+        const existing = document.getElementById(BTSOW_DIALOG_ID);
+        if (existing) return existing;
+        injectStyles();
+
+        const overlay = document.createElement('div');
+        overlay.id = BTSOW_DIALOG_ID;
+        overlay.className = 'mtt-qb-overlay';
+        overlay.setAttribute(OWNED_ATTR, '');
+
+        const panel = document.createElement('form');
+        panel.className = 'mtt-qb-panel';
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-modal', 'true');
+        panel.setAttribute('aria-labelledby', 'mtt-btsow-title');
+
+        const title = document.createElement('h2');
+        title.id = 'mtt-btsow-title';
+        title.textContent = 'BTSOW 域名设置';
+
+        const description = document.createElement('p');
+        description.textContent = 'BTSOW 更换域名后，在此填写新域名即可识别磁力详情页。每行填写一个域名，也可用逗号分隔；不需要填写详情页路径。';
+
+        const label = document.createElement('label');
+        label.className = 'mtt-qb-field';
+        label.textContent = 'BTSOW 域名';
+        const input = document.createElement('textarea');
+        input.name = 'btsow-domains';
+        input.value = getBtsowDomains().join('\n');
+        input.placeholder = 'btsow.live';
+        input.spellcheck = false;
+        label.appendChild(input);
+
+        const actions = document.createElement('div');
+        actions.className = 'mtt-qb-actions';
+        const save = document.createElement('button');
+        save.type = 'submit';
+        save.textContent = '保存';
+        const cancel = document.createElement('button');
+        cancel.type = 'button';
+        cancel.textContent = '取消';
+        cancel.addEventListener('click', () => overlay.remove());
+        actions.append(save, cancel);
+
+        const status = document.createElement('div');
+        status.className = 'mtt-qb-status';
+        status.setAttribute('role', 'status');
+        panel.addEventListener('submit', event => {
+            event.preventDefault();
+            try {
+                const domains = saveBtsowDomains(input.value);
+                input.value = domains.join('\n');
+                status.textContent = '已保存。当前页面如符合域名设置，将立即重新扫描。';
+                status.dataset.kind = 'success';
+                scan(document.body);
+            } catch (error) {
+                status.textContent = error?.message || String(error);
+                status.dataset.kind = 'error';
+            }
+        });
+
+        panel.append(title, description, label, actions, status);
+        overlay.appendChild(panel);
+        document.body.appendChild(overlay);
+        input.focus();
+        return overlay;
+    }
+
     function registerQbMenuCommands() {
         if (typeof GM_registerMenuCommand !== 'function') return;
         GM_registerMenuCommand('⚙️ qBittorrent 设置', openQbSettings);
         GM_registerMenuCommand('🔌 测试 qBittorrent 登录', showQbConnectionResult);
+        GM_registerMenuCommand('🌐 BTSOW 域名设置', openBtsowSettings);
     }
 
     function createTorrentButton(hash, magnet = '') {
@@ -951,13 +1077,55 @@
         return elements;
     }
 
+
+    function getBtsowMagnet(field) {
+        return findMagnets(field.value || field.textContent || '')[0] || null;
+    }
+
+    function handleBtsowMagnetFields(root) {
+        if (!isBtsowDetailPage()) return;
+        for (const field of collect(root, 'textarea.magnet-link, input.magnet-link')) {
+            if (field.closest('[' + OWNED_ATTR + ']')) continue;
+            if (!field.dataset.mttBtsowWatching) {
+                field.addEventListener('input', () => schedule(field));
+                field.addEventListener('change', () => schedule(field));
+                field.dataset.mttBtsowWatching = 'true';
+            }
+
+            const magnetInfo = getBtsowMagnet(field);
+            const sibling = field.nextElementSibling;
+            const existing = sibling?.classList.contains('mtt-btsow-buttons') &&
+                sibling.hasAttribute(OWNED_ATTR) ? sibling : null;
+
+            if (!magnetInfo) {
+                existing?.remove();
+                continue;
+            }
+            const { hash, magnet } = magnetInfo;
+            if (existing?.dataset.hash === hash && existing.firstElementChild?.dataset.magnet === magnet) continue;
+            existing?.remove();
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'mtt-btsow-buttons';
+            wrapper.dataset.hash = hash;
+            wrapper.setAttribute(OWNED_ATTR, '');
+            wrapper.appendChild(createTorrentButton(hash, magnet));
+            field.after(wrapper);
+        }
+    }
+
     function handleMagnetLinks(root) {
+        const btsowField = isBtsowDetailPage()
+            ? document.querySelector('textarea.magnet-link, input.magnet-link')
+            : null;
+        const btsowHash = btsowField ? getBtsowMagnet(btsowField)?.hash : null;
         for (const link of collect(root, 'a[href]')) {
             if (link.hasAttribute(OWNED_ATTR) || link.hasAttribute(PROCESSED_ATTR)) continue;
             const href = link.getAttribute('href') || '';
             if (!href.toLowerCase().startsWith('magnet:')) continue;
             const hash = extractHash(href);
             if (!hash) continue;
+            if (btsowHash === hash) continue;
 
             link.setAttribute(PROCESSED_ATTR, '');
             const next = link.nextElementSibling;
@@ -1039,6 +1207,7 @@
     function scan(root = document.body) {
         if (!root || root.nodeType === Node.ELEMENT_NODE && root.closest(`[${OWNED_ATTR}]`)) return;
         injectStyles();
+        handleBtsowMagnetFields(root);
         handleMagnetLinks(root);
         handleCodeBlocks(root);
         handleTextNodes(root);
@@ -1085,15 +1254,20 @@
             downloadTorrent,
             extractHash,
             findMagnets,
+            getBtsowDomains,
             getQbSettings,
             loginQb,
             normalizeHash,
+            normalizeBtsowDomain,
             normalizeQbUrl,
+            openBtsowSettings,
             openQbSettings,
             parseTorrentName,
+            parseBtsowDomains,
             requestQb,
             requestTorrent,
             requestTorrentViaQbittorrent,
+            saveBtsowDomains,
             saveQbSettings,
             scan,
             stop: () => observer.disconnect(),
