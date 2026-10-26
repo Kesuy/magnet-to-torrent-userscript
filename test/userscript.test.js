@@ -12,10 +12,10 @@ const TORRENT_INFO = new TextEncoder().encode('d4:name9:My Movie!e');
 const TORRENT_BYTES = new TextEncoder().encode('d4:infod4:name9:My Movie!ee');
 const TORRENT_HASH = createHash('sha1').update(TORRENT_INFO).digest('hex').toUpperCase();
 
-function boot(body, globals = {}) {
+function boot(body, globals = {}, url = 'https://example.com/topic') {
     const dom = new JSDOM(`<!doctype html><html><head></head><body>${body}</body></html>`, {
         runScripts: 'dangerously',
-        url: 'https://example.com/topic',
+        url,
     });
     Object.assign(dom.window, { TextDecoder, TextEncoder }, globals);
     Object.defineProperty(dom.window, 'crypto', { configurable: true, value: webcrypto });
@@ -43,69 +43,141 @@ test('metadata 授权所有下载源及 iTorrents 重定向域名', () => {
     assert.match(source, /^\/\/ @grant\s+GM_registerMenuCommand$/m);
 });
 
-test('规范化并持久化 aria2 RPC 设置', () => {
+test('规范化并持久化 qBittorrent WebUI 设置', () => {
     const stored = new Map();
     const { dom, api } = boot('', {
         GM_getValue(key, fallback) { return stored.has(key) ? stored.get(key) : fallback; },
         GM_setValue(key, value) { stored.set(key, value); },
     });
 
-    assert.deepEqual(JSON.parse(JSON.stringify(api.getAria2Settings())), {
-        url: 'http://127.0.0.1:6800/jsonrpc',
-        secret: '',
+    assert.equal(api.getQbSettings().url, 'http://127.0.0.1:8080');
+    assert.equal(api.getQbSettings().enabled, false);
+    const saved = api.saveQbSettings({
+        enabled: true, url: 'http://localhost:8080/',
+        username: 'admin', password: 'secret', metadataTimeoutMs: 15000,
     });
-    assert.deepEqual(JSON.parse(JSON.stringify(api.saveAria2Settings({ url: 'http://localhost:6800', secret: ' rpc-token ' }))), {
-        url: 'http://localhost:6800/jsonrpc',
-        secret: 'rpc-token',
-    });
-    assert.deepEqual(JSON.parse(JSON.stringify(api.getAria2Settings())), {
-        url: 'http://localhost:6800/jsonrpc',
-        secret: 'rpc-token',
-    });
-    assert.throws(() => api.normalizeAria2Url('file:///tmp/jsonrpc'), /仅支持 http 或 https/);
+    assert.equal(saved.url, 'http://localhost:8080');
+    assert.equal(saved.metadataTimeoutMs, 15000);
+    assert.equal(api.getQbSettings().password, 'secret');
+    assert.equal(api.getQbSettings().enabled, true);
+    assert.throws(() => api.normalizeQbUrl('file:///tmp/rpc'), /仅支持 http 或 https/);
     dom.window.close();
 });
 
-test('使用只读 getVersion 和密钥测试 aria2 连接', async () => {
-    let request;
+test('通过 WebUI 登录并获取 qBittorrent 版本', async () => {
+    const requests = [];
     const { dom, api } = boot('', {
         GM_xmlhttpRequest(options) {
-            request = options;
+            requests.push(options);
             queueMicrotask(() => options.onload({
                 status: 200,
-                response: {
-                    jsonrpc: '2.0',
-                    id: 'test',
-                    result: { version: '1.37.0', enabledFeatures: ['BitTorrent', 'GZip'] },
-                },
+                responseText: options.url.endsWith('/auth/login') ? 'Ok.' : '5.2.3',
             }));
         },
     });
 
-    const result = await api.testAria2Connection({ url: 'http://localhost:6800', secret: 'rpc-token' });
-    const payload = JSON.parse(request.data);
-    assert.equal(request.method, 'POST');
-    assert.equal(request.url, 'http://localhost:6800/jsonrpc');
-    assert.equal(request.responseType, 'json');
-    assert.equal(payload.method, 'aria2.getVersion');
-    assert.deepEqual(payload.params, ['token:rpc-token']);
-    assert.equal(result.version, '1.37.0');
-    assert.deepEqual([...result.enabledFeatures], ['BitTorrent', 'GZip']);
+    const result = await api.testQbConnection({
+        enabled: true, url: 'http://localhost:8080', username: 'admin', password: 'rpc-token',
+    });
+    assert.equal(result.version, '5.2.3');
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].method, 'POST');
+    assert.equal(requests[0].url, 'http://localhost:8080/api/v2/auth/login');
+    assert.equal(requests[0].data, 'username=admin&password=rpc-token');
+    assert.equal(requests[1].url, 'http://localhost:8080/api/v2/app/version');
     dom.window.close();
 });
 
-test('aria2 设置菜单可打开设置与测试对话框', () => {
+test('qBittorrent 与 BTSOW 菜单可打开设置面板', () => {
     const commands = [];
+    const stored = new Map();
     const { dom, document } = boot('', {
+        GM_getValue(key, fallback) { return stored.has(key) ? stored.get(key) : fallback; },
+        GM_setValue(key, value) { stored.set(key, value); },
         GM_registerMenuCommand(label, callback) { commands.push({ label, callback }); },
     });
 
-    assert.deepEqual(commands.map(command => command.label), ['⚙️ aria2 设置', '🔌 测试 aria2 连接']);
+    assert.deepEqual(commands.map(command => command.label), [
+        '⚙️ qBittorrent 设置',
+        '🔌 测试 qBittorrent 登录',
+        '🌐 BTSOW 域名设置',
+    ]);
     commands[0].callback();
-    const dialog = document.querySelector('#mtt-aria2-dialog [role="dialog"]');
+    const qbDialog = document.querySelector('#mtt-qb-dialog [role="dialog"]');
+    assert.ok(qbDialog);
+    assert.equal(qbDialog.querySelector('input[name="qb-url"]').value, 'http://127.0.0.1:8080');
+
+    commands[2].callback();
+    const dialog = document.querySelector('#mtt-btsow-dialog [role="dialog"]');
     assert.ok(dialog);
-    assert.equal(dialog.querySelector('input[name="aria2-url"]').value, 'http://127.0.0.1:6800/jsonrpc');
-    assert.match(dialog.textContent, /aria2\.getVersion/);
+    const field = dialog.querySelector('textarea[name="btsow-domains"]');
+    assert.equal(field.value, 'btsow.live');
+    field.value = 'https://btsow.live/\nbtsow.example';
+    dialog.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
+    assert.equal(stored.get('mtt-btsow-domains'), 'btsow.live\nbtsow.example');
+    assert.equal(dialog.querySelector('[role="status"]').dataset.kind, 'success');
+    dom.window.close();
+});
+
+test('BTSOW 域名可编辑、多域名去重并拒绝包含路径的地址', () => {
+    const stored = new Map();
+    const { dom, api } = boot('', {
+        GM_getValue(key, fallback) { return stored.has(key) ? stored.get(key) : fallback; },
+        GM_setValue(key, value) { stored.set(key, value); },
+    });
+    assert.deepEqual([...api.getBtsowDomains()], ['btsow.live']);
+    assert.deepEqual([...api.saveBtsowDomains('https://BTSOW.LIVE/, btsow.new\nbtsow.live')], [
+        'btsow.live', 'btsow.new',
+    ]);
+    assert.deepEqual([...api.getBtsowDomains()], ['btsow.live', 'btsow.new']);
+    assert.throws(() => api.saveBtsowDomains('https://btsow.live/magnet/detail/123'), /不能包含端口、路径或参数/);
+    assert.throws(() => api.saveBtsowDomains(''), /至少填写一个/);
+    dom.window.close();
+});
+
+test('BTSOW 磁力详情页从 textarea 添加唯一的下载按钮', () => {
+    const magnet = 'magnet:?xt=urn:btih:' + HEX_HASH + '&dn=Demo';
+    const html = '<main><textarea class="magnet-link">' + magnet +
+        '</textarea><div class="magnet-action-buttons"></div><a href="' + magnet + '">Open with BT</a></main>';
+    const { dom, api, document } = boot(html, {}, 'https://btsow.live/magnet/detail/' + HEX_HASH);
+    const field = document.querySelector('textarea.magnet-link');
+    assert.equal(buttons(document).length, 1);
+    assert.equal(field.nextElementSibling.className, 'mtt-btsow-buttons');
+    assert.equal(buttons(document)[0].dataset.magnet, magnet);
+    api.scan(document.body);
+    assert.equal(buttons(document).length, 1);
+    dom.window.close();
+});
+
+test('BTSOW 磁力输入值变更后替换按钮，不留下旧的 hash', async () => {
+    const first = 'magnet:?xt=urn:btih:' + HEX_HASH;
+    const secondHash = '89ABCDEF0123456789ABCDEF0123456789ABCDEF';
+    const second = 'magnet:?xt=urn:btih:' + secondHash + '&dn=Next';
+    const { dom, document } = boot(
+        '<textarea class="magnet-link">' + first + '</textarea>', {},
+        'https://btsow.live/magnet/detail/' + HEX_HASH,
+    );
+    const field = document.querySelector('textarea.magnet-link');
+    field.value = second;
+    field.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    await new Promise(resolve => dom.window.setTimeout(resolve, 260));
+    assert.equal(buttons(document).length, 1);
+    assert.equal(buttons(document)[0].dataset.hash, secondHash);
+    assert.equal(buttons(document)[0].dataset.magnet, second);
+    dom.window.close();
+});
+
+test('BTSOW 适配只作用于设置的域名，新增域名后立即生效', () => {
+    const magnet = 'magnet:?xt=urn:btih:' + HEX_HASH;
+    const { dom, api, document } = boot(
+        '<textarea class="magnet-link">' + magnet + '</textarea>',
+        { GM_getValue(key, fallback) { return fallback; }, GM_setValue(key, value) { this._store = [key, value]; } },
+        'https://btsow.new/magnet/detail/' + HEX_HASH,
+    );
+    assert.equal(buttons(document).length, 0);
+    api.saveBtsowDomains('btsow.live\nbtsow.new');
+    api.scan(document.body);
+    assert.equal(buttons(document).length, 1);
     dom.window.close();
 });
 
@@ -182,7 +254,7 @@ test('当前一个缓存源失败时自动尝试下一个源', async () => {
     assert.equal(api.parseTorrentName(bytes), 'My Movie!');
     assert.deepEqual(requested, [
         `https://itorrents.net/torrent/${TORRENT_HASH}.torrent`,
-        `https://torrage.info/torrent/${TORRENT_HASH}.torrent`,
+        `https://torrage.info/torrent.php?h=${TORRENT_HASH}`,
         `https://itorrents.org/torrent/${TORRENT_HASH}.torrent`,
     ]);
     dom.window.close();
